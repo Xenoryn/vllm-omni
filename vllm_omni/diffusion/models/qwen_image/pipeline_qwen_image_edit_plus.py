@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -41,6 +42,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.qwen_image.stepwise_mixin import QwenImageStepwiseMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -57,6 +59,9 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 CONDITION_IMAGE_SIZE = 384 * 384
 VAE_IMAGE_SIZE = 1024 * 1024
@@ -185,11 +190,23 @@ def get_qwen_image_edit_plus_post_process_func(
 
 
 class QwenImageEditPlusPipeline(
-    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    SupportImageInput,
+    QwenImageStepwiseMixin,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    # Step-wise continuous batching support. prepare_encode populates per-request
+    # state (encoded prompts, packed image_latents, timesteps) that the runner
+    # gathers into a batched InputBatch each step. The remaining hooks
+    # (denoise_step, step_scheduler, post_decode) are inherited from
+    # QwenImageStepwiseMixin and are identical across all QwenImage pipelines.
+    supports_step_execution: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -818,3 +835,168 @@ class QwenImageEditPlusPipeline(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        """Populate pre-request state for step-wise multi-image edit denoising.
+
+        Mirrors ``forward()``'s preparation up to (but not including) the
+        denoise loop, then stores the packed ``image_latents`` on
+        ``state.sampling.image_latent`` so ``InputBatch._prepare_image_latents``
+        can gather it across the batch.
+
+        The pre-processed condition and VAE images (produced by
+        ``get_qwen_image_edit_plus_pre_process_func``) are read from
+        ``state.prompt["additional_information"]`` - the same sink
+        ``forward()`` uses on the request-mode path.
+        """
+        sampling = state.sampling
+        first_prompt = state.prompt
+        if first_prompt is None:
+            raise ValueError(
+                "QwenImageEditPlusPipeline.prepare_encode requires a non-null state.prompt."
+            )
+        if isinstance(first_prompt, str):
+            raise ValueError(
+                "QwenImageEditPlusPipeline requires an image-bearing prompt. "
+                "A raw string prompt was passed to step-wise prepare_encode."
+            )
+        prompt = first_prompt.get("prompt") or ""
+        negative_prompt = first_prompt.get("negative_prompt")
+
+        additional_information = first_prompt.get("additional_information") or {}
+        condition_images = additional_information.get("condition_images")
+        vae_images = additional_information.get("vae_images")
+        vae_image_sizes = additional_information.get("vae_image_sizes")
+        calculated_height = additional_information.get("calculated_height")
+        calculated_width = additional_information.get("calculated_width")
+        if not condition_images or not vae_images or not vae_image_sizes:
+            raise ValueError(
+                "EditPlus step-wise prepare_encode expected the pre-process "
+                "function to populate condition_images / vae_images / "
+                "vae_image_sizes on additional_information. Ensure the "
+                "QwenImageEditPlusPipeline pre-processor ran before scheduling"
+            )
+
+        height = sampling.height or calculated_height
+        width = sampling.width or calculated_width
+        if height is None or width is None:
+            raise ValueError(
+                "EditPlus step-wise prepare_encode: neither sampling.(height,width) "
+                "nor additional_information.(calculated_height, calculated_width) provided"
+            )
+        height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+
+        num_inference_steps = sampling.num_inference_steps or 50
+        sigmas = sampling.sigmas
+        max_sequence_length = sampling.max_sequence_length or self.tokenizer_max_length
+        generator = sampling.generator
+        true_cfg_scale = sampling.true_cfg_scale or 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+        num_outputs_per_prompt = (
+            sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        )
+
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            image=None,
+            negative_prompt=negative_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = kwargs.get("attention_kwargs") or {}
+        self._current_timestep = None
+        self._interrupt = False
+
+        batch_size = 1
+        has_neg_prompt = negative_prompt is not None
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=prompt,
+            image=condition_images,
+            num_images_per_prompt=num_outputs_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=negative_prompt,
+                image=condition_images,
+                num_images_per_prompt=num_outputs_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+
+        num_channels_latents = self.transformer.in_channels // 4
+        latents, image_latents = self.prepare_latents(
+            vae_images,
+            batch_size * num_outputs_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            self.device,
+            generator,
+            sampling.latents,
+        )
+
+        img_shapes = [
+            [
+                (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
+                *[
+                    (1, vae_h // self.vae_scale_factor // 2, vae_w // self.vae_scale_factor // 2)
+                    for vae_w, vae_h in vae_image_sizes
+                ],
+            ]
+        ] * batch_size
+
+        timesteps, num_inference_steps = self.prepare_timesteps(
+            num_inference_steps, sigmas, latents.shape[1]
+        )
+        self._num_timesteps = len(timesteps)
+
+        if self.transformer.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        else:
+            guidance = None
+
+        txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
+        negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
+
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+
+        state.prompt_embeds = prompt_embeds
+        state.prompt_embeds_mask = prompt_embeds_mask
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = do_true_cfg
+        state.guidance = guidance
+        state.img_shapes = img_shapes
+        state.txt_seq_lens = txt_seq_lens
+        state.negative_txt_seq_lens = negative_txt_seq_lens
+        state.extra["height"] = height
+        state.extra["width"] = width
+        # Match forward(): QwenImage CFG output is always normalized
+        state.sampling.cfg_normalize = True
+        # InputBatch._prepare_image_latents (worker/input_batch.py) reads
+        # this to gather the batched image_latents tensor each step.
+        state.sampling.image_latent = image_latents
+
+        return state

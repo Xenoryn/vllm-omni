@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import inspect
 import json
 import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.qwen_image.stepwise_mixin import QwenImageStepwiseMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -52,6 +54,10 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
 # Interface called in diffusion engine
@@ -203,11 +209,18 @@ def retrieve_latents(
 
 
 class QwenImageLayeredPipeline(
-    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    SupportImageInput,
+    QwenImageStepwiseMixin,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    supports_step_execution: ClassVar[bool] = True
 
     color_format = "RGBA"
 
@@ -647,6 +660,229 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
     @property
     def interrupt(self):
         return self._interrupt
+
+    def _get_stepwise_transformer_kwargs(
+        self,
+        input_batch: "InputBatch",
+    ) -> dict[str, torch.Tensor]:
+        is_rgb = torch.zeros(input_batch.latents.shape[0], device=self.device, dtype=torch.long)
+        return {"additional_t_cond": is_rgb}
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        """Populate per-request state for step-wise layered image editing."""
+        sampling = state.sampling
+        first_prompt = state.prompt
+        if first_prompt is None:
+            raise ValueError("QwenImageLayeredPipeline.prepare_encode requires a non-null state.prompt.")
+        if isinstance(first_prompt, str):
+            raise ValueError(
+                "QwenImageLayeredPipeline requires an image-bearing prompt. "
+                "A raw string prompt was passed to step-wise prepare_encode."
+            )
+
+        prompt = first_prompt.get("prompt") or ""
+        negative_prompt = first_prompt.get("negative_prompt")
+        additional_information = first_prompt.get("additional_information") or {}
+        prompt_image = additional_information.get("prompt_image")
+        image = additional_information.get("preprocessed_image")
+        calculated_height = additional_information.get("calculated_height")
+        calculated_width = additional_information.get("calculated_width")
+        if image is None or prompt_image is None:
+            raise ValueError(
+                "QwenImageLayeredPipeline step-wise prepare_encode expected "
+                "the pre-process function to populate preprocessed_image and "
+                "prompt_image on additional_information."
+            )
+
+        image = image.to(dtype=self.text_encoder.dtype)
+        height = sampling.height or calculated_height
+        width = sampling.width or calculated_width
+        if height is None or width is None:
+            raise ValueError(
+                "QwenImageLayeredPipeline step-wise prepare_encode requires "
+                "height and width from sampling params or preprocessing."
+            )
+
+        layers = sampling.layers
+        max_sequence_length = sampling.max_sequence_length or self.tokenizer_max_length
+        cfg_normalize = sampling.cfg_normalize
+        use_en_prompt = sampling.use_en_prompt
+        num_inference_steps = sampling.num_inference_steps or 50
+        sigmas = sampling.sigmas
+        generator = sampling.generator
+        true_cfg_scale = sampling.true_cfg_scale or 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else None
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            negative_prompt=negative_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = kwargs.get("attention_kwargs") or {}
+        self._current_timestep = None
+        self._interrupt = False
+
+        if prompt is None or prompt == "" or prompt == " ":
+            prompt = self.get_image_caption(prompt_image, use_en_prompt=use_en_prompt, device=self.device)
+
+        batch_size = 1
+        has_neg_prompt = negative_prompt is not None
+        if true_cfg_scale > 1 and not has_neg_prompt:
+            logger.warning(
+                f"true_cfg_scale is passed as {true_cfg_scale}, but classifier-free "
+                f"guidance is not enabled since no negative_prompt is provided."
+            )
+        elif true_cfg_scale <= 1 and has_neg_prompt:
+            logger.warning(
+                " negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale <= 1"
+            )
+
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=prompt,
+            device=self.device,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=negative_prompt,
+                device=self.device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+
+        num_channels_latents = self.transformer.in_channels // 4
+        latents, image_latents = self.prepare_latents(
+            image,
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            layers,
+            prompt_embeds.dtype,
+            self.device,
+            generator,
+            sampling.latents,
+        )
+        img_shapes = [
+            [
+                *[
+                    (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2)
+                    for _ in range(layers + 1)
+                ],
+                (1, calculated_height // self.vae_scale_factor // 2, calculated_width // self.vae_scale_factor // 2),
+            ]
+        ] * batch_size
+
+        sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1] if sigmas is None else sigmas
+        base_seqlen = 256 * 256 / 16 / 16
+        mu = (image_latents.shape[1] / base_seqlen) ** 0.5
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            self.device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        self._num_timesteps = len(timesteps)
+
+        if self.transformer.guidance_embeds and guidance_scale is None:
+            raise ValueError("guidance_scale is required for guidance-distilled model.")
+        elif self.transformer.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, device=self.device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        elif not self.transformer.guidance_embeds and guidance_scale is not None:
+            logger.warning(
+                f"guidance_scale is passed as {guidance_scale}, but ignored since the model is not guidance-distilled."
+            )
+            guidance = None
+        else:
+            guidance = None
+
+        txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
+        negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
+
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+
+        state.prompt_embeds = prompt_embeds
+        state.prompt_embeds_mask = prompt_embeds_mask
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = do_true_cfg
+        state.guidance = guidance
+        state.img_shapes = img_shapes
+        state.txt_seq_lens = txt_seq_lens
+        state.negative_txt_seq_lens = negative_txt_seq_lens
+        state.extra["height"] = height
+        state.extra["width"] = width
+        state.extra["layers"] = layers
+        state.sampling.cfg_normalize = cfg_normalize
+        state.sampling.image_latent = image_latents
+
+        return state
+
+    def post_decode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Decode final layered latents from *state*."""
+        self._current_timestep = None
+        height = state.extra.get("height") or state.sampling.height
+        width = state.extra.get("width") or state.sampling.width
+        layers = state.extra.get("layers", state.sampling.layers)
+        output_type = kwargs.get("output_type") or state.sampling.output_type or "pil"
+        if state.latents is None:
+            raise ValueError(f"Request {state.request_id} has no latents to decode.")
+
+        if output_type == "latent":
+            image = state.latents
+        else:
+            latents = self._unpack_latents(state.latents, height, width, layers, self.vae_scale_factor)
+            latents = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
+            latents = latents / latents_std + latents_mean
+
+            b, c, f, h, w = latents.shape
+            latents = latents[:, :, 1:]
+            output_frames = f - 1
+            latents = latents.permute(0, 2, 1, 3, 4).view(-1, c, 1, h, w)
+            image = self.vae.decode(latents, return_dict=False)[0].squeeze(2)
+            image = self.image_processor.postprocess(image, output_type=output_type)
+            image = [image[bidx * output_frames : (bidx + 1) * output_frames] for bidx in range(b)]
+
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Forward pass for image layered."""
