@@ -15,11 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import inspect
 import json
 import os
 from collections.abc import Callable, Iterable
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import PIL.Image
 import torch
@@ -28,6 +29,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -46,6 +48,10 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -163,6 +169,7 @@ def retrieve_timesteps(
 
 class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     supports_request_batch = False
+    supports_step_execution: ClassVar[bool] = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -715,6 +722,447 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
             image = self.vae.decode(latents, return_dict=False)[0]
             # image = self.image_processor.postprocess(image, output_type=output_type)
+
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return DiffusionOutput(output=image, stage_durations=stage_durations)
+
+    def _prepare_generation_context(
+        self,
+        prompts,
+        sampling,
+    ) -> dict[str, Any]:
+        """Prepare step-execution state with the same request setup as forward()."""
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in prompts]
+
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in prompts):
+            negative_prompt = None
+        elif prompts:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in prompts]
+
+        prompt_embeds = None
+        negative_prompt_embeds = None
+
+        image = None
+        if prompts:
+            if len(prompts) > 1:
+                logger.warning(
+                    "This model only supports a single prompt for img2img, not a batched request. "
+                    "Taking only the first image for now."
+                )
+            first_prompt = prompts[0]
+            if not isinstance(first_prompt, str):
+                raw_image = first_prompt.get("multi_modal_data", {}).get("image")
+                if raw_image is not None:
+                    if isinstance(raw_image, list):
+                        image = [PIL.Image.open(im) if isinstance(im, str) else raw_image[0] for im in raw_image[:1]]
+                    else:
+                        image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
+
+        explicit_strength = sampling.strength is not None
+        strength = sampling.strength if explicit_strength else 0.6
+        if explicit_strength and image is None:
+            logger.warning(
+                "strength parameter (%.2f) is only applicable for image-to-image (I2I) generation. "
+                "It will be ignored for text-to-image (T2I) generation.",
+                strength,
+            )
+            strength = None
+        if image is not None and strength is not None and (strength < 0 or strength > 1):
+            raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
+
+        height = sampling.height or 1024
+        width = sampling.width or 1024
+        num_inference_steps = sampling.num_inference_steps or 50
+        generator = sampling.generator
+        sigmas = sampling.sigmas
+        max_sequence_length = sampling.max_sequence_length or 512
+        guidance_scale = sampling.guidance_scale
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        latents = sampling.latents
+
+        cfg_normalization = sampling.cfg_normalize
+        cfg_truncation = sampling.extra_args.get("cfg_truncation", 1.0)
+        joint_attention_kwargs: dict[str, Any] | None = None
+
+        vae_scale = self.vae_scale_factor * 2
+        if height % vae_scale != 0:
+            raise ValueError(
+                f"Height must be divisible by {vae_scale} (got {height}). "
+                f"Please adjust the height to a multiple of {vae_scale}."
+            )
+        if width % vae_scale != 0:
+            raise ValueError(
+                f"Width must be divisible by {vae_scale} (got {width}). "
+                f"Please adjust the width to a multiple of {vae_scale}."
+            )
+
+        device = self._execution_device
+
+        self._guidance_scale = guidance_scale
+        self._joint_attention_kwargs = joint_attention_kwargs
+        self._interrupt = False
+        self._cfg_normalization = cfg_normalization
+        self._cfg_truncation = cfg_truncation
+        batch_size = len(prompt)
+
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+        ) = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            device=device,
+            max_sequence_length=max_sequence_length,
+        )
+
+        num_channels_latents = self.transformer.in_channels
+
+        if image is not None:
+            if isinstance(image, list):
+                image = image[0]
+
+            if not isinstance(image, torch.Tensor):
+                init_image = self.image_processor.preprocess(image, height, width)
+                image = init_image.to(dtype=torch.float32, device=device)
+
+            mu = calculate_shift(
+                (height // self.vae_scale_factor // 2) * (width // self.vae_scale_factor // 2),
+                self.scheduler.config.get("base_image_seq_len", 256),
+                self.scheduler.config.get("max_image_seq_len", 4096),
+                self.scheduler.config.get("base_shift", 0.5),
+                self.scheduler.config.get("max_shift", 1.15),
+            )
+            self.scheduler.sigma_min = 0.0
+            scheduler_kwargs = {"mu": mu}
+
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler,
+                num_inference_steps,
+                device,
+                sigmas=sigmas,
+                **scheduler_kwargs,
+            )
+
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+
+            if num_inference_steps < 1:
+                raise ValueError(
+                    f"After adjusting the num_inference_steps by strength parameter: "
+                    f"{strength}, the number of pipeline steps is {num_inference_steps} "
+                    f"which is < 1 and not appropriate for this pipeline."
+                )
+            latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
+            latents = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds[0].dtype,
+                device,
+                generator,
+                latents,
+                image,
+                latent_timestep,
+            )
+        else:
+            latents = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                torch.float32,
+                device,
+                generator,
+                latents,
+            )
+
+        if num_images_per_prompt > 1:
+            prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
+            if self.do_classifier_free_guidance and negative_prompt_embeds:
+                negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
+
+        if image is None:
+            image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+            mu = calculate_shift(
+                image_seq_len,
+                self.scheduler.config.get("base_image_seq_len", 256),
+                self.scheduler.config.get("max_image_seq_len", 4096),
+                self.scheduler.config.get("base_shift", 0.5),
+                self.scheduler.config.get("max_shift", 1.15),
+            )
+            self.scheduler.sigma_min = 0.0
+            scheduler_kwargs = {"mu": mu}
+
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler,
+                num_inference_steps,
+                device,
+                sigmas=sigmas,
+                **scheduler_kwargs,
+            )
+
+        self._num_timesteps = len(timesteps)
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "latents": latents,
+            "timesteps": timesteps,
+            "do_classifier_free_guidance": self.do_classifier_free_guidance,
+            "guidance_scale": guidance_scale,
+            "cfg_normalization": cfg_normalization,
+            "cfg_truncation": cfg_truncation,
+            "output_type": sampling.output_type or "pil",
+        }
+
+    @staticmethod
+    def _prompt_embeds_to_padded(
+        prompt_embeds: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        seq_lens = [int(prompt_embed.shape[0]) for prompt_embed in prompt_embeds]
+        padded = pad_sequence(prompt_embeds, batch_first=True, padding_value=0.0)
+        mask = torch.zeros(padded.shape[:2], dtype=torch.bool, device=padded.device)
+        for i, seq_len in enumerate(seq_lens):
+            mask[i, :seq_len] = True
+        return padded, mask, seq_lens
+
+    @staticmethod
+    def _padded_prompt_embeds_to_list(
+        prompt_embeds: torch.Tensor | list[torch.Tensor],
+        prompt_embeds_mask: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        if isinstance(prompt_embeds, list):
+            return prompt_embeds
+
+        if prompt_embeds.ndim == 2:
+            prompt_embeds = prompt_embeds.unsqueeze(0)
+        if prompt_embeds_mask is not None and prompt_embeds_mask.ndim == 1:
+            prompt_embeds_mask = prompt_embeds_mask.unsqueeze(0)
+
+        embeds_list = []
+        for i in range(prompt_embeds.shape[0]):
+            if prompt_embeds_mask is None:
+                embeds_list.append(prompt_embeds[i])
+            else:
+                embeds_list.append(prompt_embeds[i][prompt_embeds_mask[i].bool()])
+        return embeds_list
+
+    @staticmethod
+    def _extra_row_values(
+        states,
+        key: str,
+        default: float,
+    ) -> list[float]:
+        values: list[float] = []
+        for state in states:
+            value = state.extra.get(key, default)
+            row_count = int(state.latents.shape[0])
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().tolist()
+            if isinstance(value, list):
+                if len(value) == row_count:
+                    values.extend(float(item) for item in value)
+                elif len(value) == 1:
+                    values.extend([float(value[0])] * row_count)
+                else:
+                    raise ValueError(f"Expected 1 or {row_count} values for {key}, got {len(value)}.")
+            else:
+                values.extend([float(value)] * row_count)
+        return values
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        del kwargs
+        prompts = [state.prompt] if state.prompt is not None else []
+        ctx = self._prepare_generation_context(prompts, state.sampling)
+
+        req_scheduler = copy.deepcopy(self.scheduler)
+
+        prompt_embeds, prompt_embeds_mask, txt_seq_lens = self._prompt_embeds_to_padded(ctx["prompt_embeds"])
+        state.prompt_embeds = prompt_embeds
+        state.prompt_embeds_mask = prompt_embeds_mask
+        state.txt_seq_lens = txt_seq_lens
+
+        if ctx["negative_prompt_embeds"]:
+            negative_prompt_embeds, negative_prompt_embeds_mask, negative_txt_seq_lens = self._prompt_embeds_to_padded(
+                ctx["negative_prompt_embeds"]
+            )
+            state.negative_prompt_embeds = negative_prompt_embeds
+            state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
+            state.negative_txt_seq_lens = negative_txt_seq_lens
+        else:
+            state.negative_prompt_embeds = None
+            state.negative_prompt_embeds_mask = None
+            state.negative_txt_seq_lens = None
+
+        state.latents = ctx["latents"]
+        state.timesteps = ctx["timesteps"]
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = bool(ctx["do_classifier_free_guidance"])
+        state.guidance = torch.full(
+            (state.latents.shape[0],),
+            float(ctx["guidance_scale"]),
+            dtype=state.latents.dtype,
+            device=state.latents.device,
+        )
+        state.extra["z_image_cfg_normalization"] = float(ctx["cfg_normalization"])
+        state.extra["z_image_cfg_truncation"] = float(ctx["cfg_truncation"])
+        state.extra["z_image_output_type"] = ctx["output_type"]
+
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: "InputBatch",
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        del kwargs
+        if self.interrupt:
+            return None
+
+        prompt_embeds = self._padded_prompt_embeds_to_list(
+            input_batch.prompt_embeds,
+            input_batch.prompt_embeds_mask,
+        )
+        if input_batch.negative_prompt_embeds is None:
+            negative_prompt_embeds = None
+        else:
+            negative_prompt_embeds = self._padded_prompt_embeds_to_list(
+                input_batch.negative_prompt_embeds,
+                input_batch.negative_prompt_embeds_mask,
+            )
+
+        cfg_normalization = self._extra_row_values(
+            input_batch.states,
+            "z_image_cfg_normalization",
+            0.0,
+        )
+        cfg_truncation = self._extra_row_values(
+            input_batch.states,
+            "z_image_cfg_truncation",
+            1.0,
+        )
+        actual_batch_size = int(input_batch.latents.shape[0])
+        t_norm = (1000 - input_batch.timesteps.to(device=input_batch.latents.device, dtype=torch.float32)) / 1000
+        timestep = input_batch.timesteps.to(device=input_batch.latents.device)
+        if timestep.ndim == 0:
+            timestep = timestep.expand(actual_batch_size)
+        timestep = (1000 - timestep) / 1000
+
+        guidance_scales = torch.as_tensor(
+            input_batch.guidance,
+            dtype=torch.float32,
+            device=input_batch.latents.device,
+        )
+        if guidance_scales.ndim == 0:
+            guidance_scales = guidance_scales.reshape(1).expand(actual_batch_size)
+        cfg_normalizations = torch.as_tensor(
+            cfg_normalization,
+            dtype=torch.float32,
+            device=input_batch.latents.device,
+        )
+        cfg_truncations = torch.as_tensor(
+            cfg_truncation,
+            dtype=torch.float32,
+            device=input_batch.latents.device,
+        )
+        guidance_scales = torch.where(
+            (cfg_truncations <= 1) & (t_norm > cfg_truncations),
+            torch.zeros_like(guidance_scales),
+            guidance_scales,
+        )
+
+        guidance_scale_list = guidance_scales.detach().cpu().tolist()
+        cfg_normalization_list = cfg_normalizations.detach().cpu().tolist()
+        apply_cfg = input_batch.do_true_cfg and any(scale > 0 for scale in guidance_scale_list)
+        latents_typed = input_batch.latents.to(self.od_config.dtype)
+
+        if apply_cfg:
+            if negative_prompt_embeds is None:
+                raise ValueError("negative_prompt_embeds must be initialized when Z-Image CFG is active.")
+            latent_model_input = latents_typed.repeat(2, 1, 1, 1)
+            prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
+            timestep_model_input = timestep.repeat(2)
+        else:
+            latent_model_input = latents_typed
+            prompt_embeds_model_input = prompt_embeds
+            timestep_model_input = timestep
+
+        latent_model_input = latent_model_input.unsqueeze(2)
+        latent_model_input_list = list(latent_model_input.unbind(dim=0))
+
+        model_out_list = self.transformer(
+            latent_model_input_list,
+            timestep_model_input,
+            prompt_embeds_model_input,
+        )[0]
+
+        if apply_cfg:
+            pos_out = model_out_list[:actual_batch_size]
+            neg_out = model_out_list[actual_batch_size:]
+
+            noise_pred = []
+            for j in range(actual_batch_size):
+                pos = pos_out[j].float()
+                neg = neg_out[j].float()
+                pred = pos + float(guidance_scale_list[j]) * (pos - neg)
+
+                cfg_norm = float(cfg_normalization_list[j])
+                if cfg_norm > 0.0:
+                    ori_pos_norm = torch.linalg.vector_norm(pos)
+                    new_pos_norm = torch.linalg.vector_norm(pred)
+                    max_new_norm = ori_pos_norm * cfg_norm
+                    scale = torch.where(
+                        new_pos_norm > max_new_norm,
+                        (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(pred.dtype),
+                        pred.new_tensor(1.0),
+                    )
+                    pred = pred * scale
+
+                noise_pred.append(pred)
+
+            noise_pred = torch.stack(noise_pred, dim=0)
+        else:
+            noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
+
+        noise_pred = noise_pred.squeeze(2)
+        return -noise_pred
+
+    def step_scheduler(
+        self,
+        state: "DiffusionRequestState",
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        if self.interrupt:
+            return
+        state.latents = state.scheduler.step(
+            noise_pred.to(torch.float32), state.current_timestep, state.latents, return_dict=False
+        )[0]
+        assert state.latents.dtype == torch.float32
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        output_type = kwargs.get("output_type") or state.extra.get("z_image_output_type") or "pil"
+        if output_type == "latent":
+            image = state.latents
+        else:
+            latents = state.latents.to(self.vae.dtype)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            image = self.vae.decode(latents, return_dict=False)[0]
 
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
         return DiffusionOutput(output=image, stage_durations=stage_durations)

@@ -44,6 +44,7 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 | Pipeline | Example models | Step execution |
 |----------|----------------|----------------|
 | `QwenImagePipeline` | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes |
+| `ZImagePipeline` | `Tongyi-MAI/Z-Image-Turbo` | Yes |
 | All other diffusion pipelines | `QwenImageEditPipeline`, `QwenImageEditPlusPipeline`, `QwenImageLayeredPipeline`, GLM-Image, Wan, Flux, etc. | No |
 
 !!! warning "Experimental continuous batching"

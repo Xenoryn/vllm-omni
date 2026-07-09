@@ -1033,6 +1033,27 @@ class TestSupportedPipelines:
         assert supports_step_execution(pipeline) is True
         assert isinstance(pipeline, SupportsStepExecution) is True
 
+    def test_z_image_supports_step_execution(self):
+        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
+        from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+        # Avoid loading model weights; protocol membership depends on the class contract.
+        pipeline = object.__new__(ZImagePipeline)
+
+        assert pipeline.supports_step_execution is True
+        assert supports_step_execution(pipeline) is True
+        assert isinstance(pipeline, SupportsStepExecution) is True
+
+    def test_supports_step_execution_honors_false_capability_flag(self):
+        from vllm_omni.diffusion.models.interface import supports_step_execution
+
+        class _InheritedButDisabledStepPipeline(_StepPipeline):
+            supports_step_execution = False
+
+        pipeline = _InheritedButDisabledStepPipeline()
+
+        assert supports_step_execution(pipeline) is False
+
 
 @hardware_test(
     res={"cuda": "L4"},

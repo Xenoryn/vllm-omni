@@ -69,6 +69,7 @@ class MingImagePipeline(ZImagePipeline):
     """
 
     supports_request_batch = False
+    supports_step_execution = False
 
     def __init__(
         self,

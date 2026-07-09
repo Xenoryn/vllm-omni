@@ -100,6 +100,18 @@ def _get_diffusion_feature_cases():
             id="layerwise_hsdp",
             marks=[*FOUR_CARD_MARKS],
         ),
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--step-execution",
+                    "--max-num-seqs",
+                    "2",
+                ],
+            ),
+            id="step_execution_batch2",
+            marks=hardware_marks(res={"cuda": "L4"}, num_cards=1),
+        ),
     ]
 
 

@@ -99,4 +99,4 @@ class SupportsComponentDiscovery(Protocol):
 def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 
-    return isinstance(pipeline, SupportsStepExecution)
+    return bool(getattr(pipeline, "supports_step_execution", False)) and isinstance(pipeline, SupportsStepExecution)
