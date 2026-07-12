@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.z_image.z_image_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -167,6 +168,13 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    @staticmethod
+    def _resolve_guidance_scale(sampling_params: OmniDiffusionSamplingParams) -> float:
+        """Honor an explicit guidance scale; otherwise use Z-Image's no-CFG default."""
+        if sampling_params.guidance_scale_provided:
+            return float(sampling_params.guidance_scale)
+        return 0.0
 
     def __init__(
         self,
@@ -457,7 +465,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         generator = req.sampling_params.generator
         sigmas = req.sampling_params.sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or 512
-        guidance_scale = req.sampling_params.guidance_scale
+        guidance_scale = self._resolve_guidance_scale(req.sampling_params)
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt if req.sampling_params.num_outputs_per_prompt > 0 else 1
         )
