@@ -44,7 +44,6 @@ from vllm_omni.diffusion.models.z_image.z_image_transformer import (
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.param_utils import resolve_guidance_scale
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
