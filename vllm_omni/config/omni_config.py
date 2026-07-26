@@ -111,6 +111,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ring_degree: int
     allgather_degree: int
     ulysses_mode: str
+    sp_communication_backend: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     use_hsdp: bool
@@ -363,6 +364,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
+    sp_communication_backend: Literal["native", "functional"] = "native"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
@@ -379,6 +381,16 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
+        if self.sp_communication_backend not in {"native", "functional"}:
+            raise ValueError("sp_communication_backend must be 'native' or 'functional'")
+        if self.sp_communication_backend == "functional" and (
+            self.ulysses_degree <= 1 or self.ring_degree != 1 or self.allgather_degree != 1
+        ):
+            raise ValueError(
+                "sp_communication_backend='functional' currently supports pure "
+                "Ulysses only (ulysses_degree > 1, ring_degree = "
+                "allgather_degree = 1)."
+            )
         if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
             raise ValueError(
                 "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "

@@ -11,10 +11,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.functional_collectives import (
+    functional_all_gather_tensor,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -95,10 +99,7 @@ class SequenceShardMetadata:
     def local_valid_length(self, global_valid_length: int) -> int:
         """Return this rank's valid prefix length for a global prefix."""
         if global_valid_length < 0 or global_valid_length > self.original_seq_len:
-            raise ValueError(
-                f"global_valid_length must be in [0, {self.original_seq_len}], "
-                f"got {global_valid_length}."
-            )
+            raise ValueError(f"global_valid_length must be in [0, {self.original_seq_len}], got {global_valid_length}.")
         return max(
             0,
             min(global_valid_length, self.local_end) - self.local_start,
@@ -119,8 +120,7 @@ class SequenceShardMetadata:
                 raise ValueError("Segment lengths must be non-negative.")
             if sum(int(length) for length in sample_lengths) > self.original_seq_len:
                 raise ValueError(
-                    "The sum of segment lengths cannot exceed original_seq_len "
-                    f"({self.original_seq_len})."
+                    f"The sum of segment lengths cannot exceed original_seq_len ({self.original_seq_len})."
                 )
 
             sample_local: list[int] = []
@@ -130,8 +130,7 @@ class SequenceShardMetadata:
                 sample_local.append(
                     max(
                         0,
-                        min(segment_end, self.local_end)
-                        - max(segment_start, self.local_start),
+                        min(segment_end, self.local_end) - max(segment_start, self.local_start),
                     )
                 )
                 segment_start = segment_end
@@ -190,6 +189,7 @@ def sp_gather(
     tensor: torch.Tensor,
     dim: int,
     validate: bool = True,
+    communication_backend: Literal["native", "functional"] = "native",
 ) -> torch.Tensor:
     """Gather a tensor along the specified dimension from all sequence parallel ranks.
 
@@ -199,6 +199,8 @@ def sp_gather(
         tensor: The local shard to gather.
         dim: The dimension along which to gather.
         validate: If True, validate tensor consistency (currently unused).
+        communication_backend: Collective implementation. ``functional`` is
+            graphable by ``torch.compile`` and currently supports CUDA/NCCL.
 
     Returns:
         The full tensor gathered from all ranks.
@@ -213,6 +215,14 @@ def sp_gather(
         return tensor
 
     sp_group = get_sp_group()
+    if communication_backend == "functional":
+        return functional_all_gather_tensor(
+            tensor,
+            gather_dim=dim,
+            group=sp_group.device_group,
+        )
+    if communication_backend != "native":
+        raise ValueError(f"communication_backend must be 'native' or 'functional', got {communication_backend!r}.")
     return sp_group.all_gather(tensor, dim=dim)
 
 

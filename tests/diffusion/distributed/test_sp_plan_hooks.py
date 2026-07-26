@@ -1029,6 +1029,160 @@ class TestStrictModeSplitValidation:
 
 
 @pytest.mark.cpu
+class TestKeyedSequenceShardMetadata:
+    """Test independent sequence padding metadata used by public SP hooks."""
+
+    def test_local_prefix_and_segment_lengths(self):
+        from vllm_omni.diffusion.distributed.sp_sharding import (
+            SequenceShardMetadata,
+        )
+
+        rank_zero = SequenceShardMetadata.from_global_length(
+            5,
+            world_size=2,
+            rank=0,
+        )
+        rank_one = SequenceShardMetadata.from_global_length(
+            5,
+            world_size=2,
+            rank=1,
+        )
+
+        assert rank_zero.padded_seq_len == 6
+        assert rank_zero.local_seq_len == 3
+        assert rank_zero.local_valid_lengths([5, 2]) == [3, 2]
+        assert rank_one.local_valid_lengths([5, 2]) == [2, 0]
+        assert rank_zero.local_segment_lengths([[2, 3]]) == [[2, 1]]
+        assert rank_one.local_segment_lengths([[2, 3]]) == [[0, 2]]
+
+    def test_auto_pad_tracks_independent_groups(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from vllm_omni.diffusion.attention import selector
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import (
+            SequenceParallelConfig,
+        )
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
+
+        class MaskBackend:
+            supports_attention_mask = True
+
+            @staticmethod
+            def get_name():
+                return "test"
+
+        monkeypatch.setattr(
+            parallel_state,
+            "get_sequence_parallel_world_size",
+            lambda: 2,
+        )
+        monkeypatch.setattr(
+            parallel_state,
+            "get_sequence_parallel_rank",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            parallel_state,
+            "get_ring_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            selector,
+            "get_attn_backend_for_role",
+            lambda **_: (MaskBackend(), None),
+        )
+
+        hook = SequenceParallelSplitHook(
+            {},
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+        with set_forward_context():
+            image = hook._shard_with_auto_pad(
+                torch.arange(5).reshape(1, 5, 1),
+                1,
+                "image",
+            )
+            context = hook._shard_with_auto_pad(
+                torch.arange(7).reshape(1, 7, 1),
+                1,
+                "context",
+            )
+            ctx = get_forward_context()
+
+            assert image.shape[1] == 3
+            assert context.shape[1] == 4
+            assert ctx.sp_shard_metadata["image"].original_seq_len == 5
+            assert ctx.sp_shard_metadata["context"].original_seq_len == 7
+
+            with pytest.raises(ValueError, match="same global sequence length"):
+                hook._shard_with_auto_pad(
+                    torch.zeros(1, 7, 1),
+                    1,
+                    "image",
+                )
+
+    def test_gather_uses_keyed_trim_and_configured_backend(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from vllm_omni.diffusion.distributed.sp_plan import (
+            SequenceParallelConfig,
+        )
+        from vllm_omni.diffusion.distributed.sp_sharding import (
+            SequenceShardMetadata,
+        )
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+        from vllm_omni.diffusion.hooks import sequence_parallel
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelGatherHook,
+        )
+
+        observed = {}
+
+        def fake_gather(tensor, dim, validate, communication_backend):
+            observed["backend"] = communication_backend
+            return torch.cat([tensor, tensor], dim=dim)
+
+        monkeypatch.setattr(sequence_parallel, "sp_gather", fake_gather)
+        hook = SequenceParallelGatherHook(
+            SequenceParallelOutput(
+                gather_dim=1,
+                expected_dims=3,
+                shard_group="image",
+            ),
+            SequenceParallelConfig(
+                ulysses_degree=2,
+                communication_backend="functional",
+            ),
+        )
+
+        with set_forward_context():
+            get_forward_context().sp_shard_metadata["image"] = SequenceShardMetadata.from_global_length(
+                5,
+                world_size=2,
+                rank=0,
+            )
+            output = hook.post_forward(
+                nn.Identity(),
+                torch.zeros(1, 3, 4),
+            )
+
+        assert observed["backend"] == "functional"
+        assert output.shape == (1, 5, 4)
+
+
+@pytest.mark.cpu
 class TestSequenceParallelConfig:
     """Test SequenceParallelConfig dataclass."""
 
@@ -1062,3 +1216,33 @@ class TestSequenceParallelConfig:
 
         config = SequenceParallelConfig(ulysses_degree=2, ring_degree=4)
         assert config.sequence_parallel_size == 8
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            (
+                {
+                    "ulysses_degree": 2,
+                    "ring_degree": 2,
+                    "communication_backend": "functional",
+                },
+                "pure Ulysses",
+            ),
+            (
+                {
+                    "allgather_degree": 2,
+                    "communication_backend": "functional",
+                },
+                "pure Ulysses",
+            ),
+        ],
+    )
+    def test_functional_backend_rejects_non_ulysses_modes(
+        self,
+        kwargs,
+        match,
+    ):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+
+        with pytest.raises(ValueError, match=match):
+            SequenceParallelConfig(**kwargs)

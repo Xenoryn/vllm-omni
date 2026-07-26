@@ -181,8 +181,7 @@ class SequenceParallelSplitHook(ModelHook):
             sp_input.shard_group
             for value in metadata.values()
             for sp_input in (value if isinstance(value, (list, tuple)) else (value,))
-            if isinstance(sp_input, SequenceParallelInput)
-            and sp_input.shard_group is not None
+            if isinstance(sp_input, SequenceParallelInput) and sp_input.shard_group is not None
         }
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
@@ -557,7 +556,12 @@ class SequenceParallelGatherHook(ModelHook):
                 continue
 
             # Gather from all ranks
-            gathered = sp_gather(x, spm.gather_dim, validate=False)
+            gathered = sp_gather(
+                x,
+                spm.gather_dim,
+                validate=False,
+                communication_backend=self.config.communication_backend,
+            )
 
             # Remove padding if it was applied
             original_seq_len = None
@@ -568,10 +572,7 @@ class SequenceParallelGatherHook(ModelHook):
                 else:
                     shard_metadata = ctx.sp_shard_metadata.get(spm.shard_group)
                     if shard_metadata is None:
-                        raise RuntimeError(
-                            f"No SP shard metadata was registered for "
-                            f"shard_group={spm.shard_group!r}."
-                        )
+                        raise RuntimeError(f"No SP shard metadata was registered for shard_group={spm.shard_group!r}.")
                     original_seq_len = shard_metadata.original_seq_len
             if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
                 gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)

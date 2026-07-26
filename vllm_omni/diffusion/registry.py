@@ -469,12 +469,14 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if allgather_degree > 1:
                 sp_config = SequenceParallelConfig(
                     allgather_degree=allgather_degree,
+                    communication_backend=od_config.parallel_config.sp_communication_backend,
                 )
                 mode = "allgather_kv"
             else:
                 sp_config = SequenceParallelConfig(
                     ulysses_degree=od_config.parallel_config.ulysses_degree,
                     ring_degree=od_config.parallel_config.ring_degree,
+                    communication_backend=od_config.parallel_config.sp_communication_backend,
                 )
                 # Apply hooks according to the plan
                 mode = (

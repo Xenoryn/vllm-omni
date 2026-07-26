@@ -8,13 +8,22 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from vllm_omni.diffusion.distributed.functional_collectives import (
+    functional_all_to_all_single,
+)
 from vllm_omni.platforms import current_omni_platform
 
 __all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "RingComm"]
 
 
 def all_to_all_4D(
-    input: torch.tensor, scatter_idx: int = 2, gather_idx: int = 1, group=None, use_sync: bool = False
+    input: torch.tensor,
+    scatter_idx: int = 2,
+    gather_idx: int = 1,
+    group=None,
+    use_sync: bool = False,
+    communication_backend: str = "native",
+    world_size: int | None = None,
 ) -> torch.tensor:
     """
     all-to-all for QKV
@@ -25,13 +34,17 @@ def all_to_all_4D(
         gather_idx (int): default 2
         group (torch.distributed.ProcessGroup): torch process group
         use_sync (bool): whether to synchronize after all-to-all
+        communication_backend (str): ``native`` or graphable ``functional``
+        world_size (int | None): cached group size for compile-friendly callers
 
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, hc, hs)
     """
     assert input.dim() == 4, f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
 
-    seq_world_size = dist.get_world_size(group)
+    seq_world_size = world_size
+    if seq_world_size is None:
+        seq_world_size = dist.get_world_size(group)
 
     if scatter_idx == 2 and gather_idx == 1:
         # input (torch.tensor): a tensor sharded along dim 1 (bs, seqlen/P, hc, hs) output: (bs, seqlen, hc/P, hs)
@@ -43,14 +56,26 @@ def all_to_all_4D(
         # (bs, seqlen/P, hc, hs) -reshape-> (bs, seq_len/P, P, hc/P, hs) -transpose(0,2)-> (P, seq_len/P, bs, hc/P, hs)
         input_t = input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs).transpose(0, 2).contiguous()
 
-        output = torch.empty_like(input_t)
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
 
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
-            if use_sync:
-                current_omni_platform.synchronize()
+            if communication_backend == "functional":
+                output = functional_all_to_all_single(
+                    input_t,
+                    output_split_sizes=None,
+                    input_split_sizes=None,
+                    group=group,
+                )
+            elif communication_backend == "native":
+                output = torch.empty_like(input_t)
+                dist.all_to_all_single(output, input_t, group=group)
+                if use_sync:
+                    current_omni_platform.synchronize()
+            else:
+                raise ValueError(
+                    f"communication_backend must be 'native' or 'functional', got {communication_backend!r}."
+                )
         else:
             output = input_t
         # if scattering the seq-dim, transpose the heads back to the original dimension
@@ -66,8 +91,6 @@ def all_to_all_4D(
         bs, seqlen, shard_hc, hs = input.shape
         hc = shard_hc * seq_world_size
         shard_seqlen = seqlen // seq_world_size
-        seq_world_size = dist.get_world_size(group)
-
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen, hc/P, hs) -reshape-> (bs, P, seq_len/P, hc/P, hs) -transpose(0, 3)->
         #  (hc/P, P, seqlen/P, bs, hs) -transpose(0, 1) -> (P, hc/P, seqlen/P, bs, hs)
@@ -79,13 +102,25 @@ def all_to_all_4D(
             .reshape(seq_world_size, shard_hc, shard_seqlen, bs, hs)
         )
 
-        output = torch.empty_like(input_t)
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
-            if use_sync:
-                current_omni_platform.synchronize()
+            if communication_backend == "functional":
+                output = functional_all_to_all_single(
+                    input_t,
+                    output_split_sizes=None,
+                    input_split_sizes=None,
+                    group=group,
+                )
+            elif communication_backend == "native":
+                output = torch.empty_like(input_t)
+                dist.all_to_all_single(output, input_t, group=group)
+                if use_sync:
+                    current_omni_platform.synchronize()
+            else:
+                raise ValueError(
+                    f"communication_backend must be 'native' or 'functional', got {communication_backend!r}."
+                )
         else:
             output = input_t
 

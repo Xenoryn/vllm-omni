@@ -204,6 +204,7 @@ class TestStageConfig:
                     "ulysses_degree": 1,
                     "ring_degree": 1,
                     "ulysses_mode": "strict",
+                    "sp_communication_backend": "native",
                     "sequence_parallel_size": 1,
                     "cfg_parallel_size": 1,
                     "vae_patch_parallel_size": 1,
@@ -218,9 +219,10 @@ class TestStageConfig:
                 "tensor_parallel_size": 8,
                 "enable_expert_parallel": True,
                 "ulysses_degree": 2,
-                "ring_degree": 4,
+                "ring_degree": 1,
                 "ulysses_mode": "advanced_uaa",
-                "sequence_parallel_size": 8,
+                "sp_communication_backend": "functional",
+                "sequence_parallel_size": 2,
                 "cfg_parallel_size": 2,
                 "vae_patch_parallel_size": 2,
                 "use_hsdp": True,
@@ -236,9 +238,10 @@ class TestStageConfig:
         assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
         assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
         assert omega_config.engine_args.parallel_config.ulysses_degree == 2
-        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ring_degree == 1
         assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
-        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.sp_communication_backend == "functional"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 2
         assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
         assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
         assert omega_config.engine_args.parallel_config.use_hsdp is True
@@ -251,6 +254,7 @@ class TestStageConfig:
         assert "ulysses_degree" not in omega_config.engine_args
         assert "ring_degree" not in omega_config.engine_args
         assert "ulysses_mode" not in omega_config.engine_args
+        assert "sp_communication_backend" not in omega_config.engine_args
         assert "sequence_parallel_size" not in omega_config.engine_args
         assert "cfg_parallel_size" not in omega_config.engine_args
         assert "vae_patch_parallel_size" not in omega_config.engine_args
@@ -269,9 +273,10 @@ class TestStageConfig:
                 "tensor_parallel_size": 8,
                 "enable_expert_parallel": True,
                 "ulysses_degree": 2,
-                "ring_degree": 4,
+                "ring_degree": 1,
                 "ulysses_mode": "advanced_uaa",
-                "sequence_parallel_size": 8,
+                "sp_communication_backend": "functional",
+                "sequence_parallel_size": 2,
                 "cfg_parallel_size": 2,
                 "vae_patch_parallel_size": 2,
                 "use_hsdp": True,
@@ -287,9 +292,10 @@ class TestStageConfig:
         assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
         assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
         assert omega_config.engine_args.parallel_config.ulysses_degree == 2
-        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ring_degree == 1
         assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
-        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.sp_communication_backend == "functional"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 2
         assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
         assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
         assert omega_config.engine_args.parallel_config.use_hsdp is True
@@ -302,6 +308,7 @@ class TestStageConfig:
         assert "ulysses_degree" not in omega_config.engine_args
         assert "ring_degree" not in omega_config.engine_args
         assert "ulysses_mode" not in omega_config.engine_args
+        assert "sp_communication_backend" not in omega_config.engine_args
         assert "sequence_parallel_size" not in omega_config.engine_args
         assert "cfg_parallel_size" not in omega_config.engine_args
         assert "vae_patch_parallel_size" not in omega_config.engine_args

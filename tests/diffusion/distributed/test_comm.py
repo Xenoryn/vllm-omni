@@ -7,14 +7,27 @@ import os
 import pytest
 import torch
 
-from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
+from vllm_omni.diffusion.distributed.comm import (
+    RingComm,
+    SeqAllToAll4D,
+    SeqAllToAll5D,
+    all_to_all_4D,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     get_sp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.distributed.sp_sharding import sp_gather
 from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+    pytest.mark.core_model,
+    pytest.mark.gpu,
+]
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -155,6 +168,125 @@ def _test_4d_identity_worker(
 
     # Cleanup distributed environment
     destroy_distributed_env()
+
+
+def test_functional_4d_is_graphable_and_matches_native():
+    """Functional 4D resharding must be equivalent and compile as one graph."""
+    if not current_omni_platform.is_cuda():
+        pytest.skip("Functional sequence-parallel collectives require CUDA/NCCL")
+    if current_omni_platform.get_device_count() < 2:
+        pytest.skip("Test requires 2 GPUs")
+
+    torch.multiprocessing.spawn(
+        _test_functional_4d_worker,
+        args=(2,),
+        nprocs=2,
+    )
+
+
+def _test_functional_4d_worker(local_rank: int, world_size: int):
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
+    update_environment_variables(
+        {
+            "RANK": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": "29502",
+        }
+    )
+
+    init_distributed_environment()
+    initialize_model_parallel(ulysses_degree=world_size)
+    group = get_sp_group().ulysses_group
+    try:
+        torch.manual_seed(42 + local_rank)
+        input_tensor = torch.randn(
+            2,
+            8,
+            8,
+            32,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        expected = all_to_all_4D(
+            input_tensor,
+            scatter_idx=2,
+            gather_idx=1,
+            group=group,
+            communication_backend="native",
+            world_size=world_size,
+        )
+
+        def functional_forward(tensor: torch.Tensor) -> torch.Tensor:
+            return all_to_all_4D(
+                tensor,
+                scatter_idx=2,
+                gather_idx=1,
+                group=group,
+                communication_backend="functional",
+                world_size=world_size,
+            )
+
+        compiled_forward = torch.compile(
+            functional_forward,
+            fullgraph=True,
+            dynamic=False,
+        )
+        actual = compiled_forward(input_tensor)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        def functional_reverse(tensor: torch.Tensor) -> torch.Tensor:
+            return all_to_all_4D(
+                tensor,
+                scatter_idx=1,
+                gather_idx=2,
+                group=group,
+                communication_backend="functional",
+                world_size=world_size,
+            )
+
+        compiled_reverse = torch.compile(
+            functional_reverse,
+            fullgraph=True,
+            dynamic=False,
+        )
+        restored = compiled_reverse(actual)
+        torch.testing.assert_close(restored, input_tensor, rtol=0, atol=0)
+
+        local_output = torch.full(
+            (1, 3, 2),
+            local_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        def functional_gather(tensor: torch.Tensor) -> torch.Tensor:
+            return sp_gather(
+                tensor,
+                dim=1,
+                communication_backend="functional",
+            )
+
+        compiled_gather = torch.compile(
+            functional_gather,
+            fullgraph=True,
+            dynamic=False,
+        )
+        gathered = compiled_gather(local_output)
+        expected_gather = torch.cat(
+            [torch.full_like(local_output, rank) for rank in range(world_size)],
+            dim=1,
+        )
+        torch.testing.assert_close(
+            gathered,
+            expected_gather,
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        destroy_distributed_env()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

@@ -433,6 +433,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "ring_degree",
         "allgather_degree",
         "ulysses_mode",
+        "sp_communication_backend",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
         "vae_parallel_mode",
@@ -580,6 +581,24 @@ def test_diffusion_parallel_config_rejects_cfg_parallel_size_outside_current_bou
 def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():
     with pytest.raises(ValidationError):
         OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "ring_degree": 2,
+            "sp_communication_backend": "functional",
+        },
+        {
+            "allgather_degree": 2,
+            "sp_communication_backend": "functional",
+        },
+    ],
+)
+def test_diffusion_parallel_config_limits_functional_backend_to_ulysses(kwargs):
+    with pytest.raises(ValidationError, match="pure Ulysses"):
+        OmniStageDiffusionParallelConfig(**kwargs)
 
 
 def test_stage_realizations_use_stage_specific_parallel_config_types():

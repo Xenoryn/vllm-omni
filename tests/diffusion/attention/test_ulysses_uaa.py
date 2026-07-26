@@ -22,6 +22,30 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+    pytest.mark.core_model,
+    pytest.mark.gpu,
+]
+
+
+def test_uaa_head_plan_preserves_gqa_ratio() -> None:
+    from vllm_omni.diffusion.attention.parallel.ulysses import (
+        _UlyssesHeadPlan,
+    )
+
+    plan = _UlyssesHeadPlan.build(
+        query_heads=28,
+        kv_heads=7,
+        world_size=2,
+        mode="advanced_uaa",
+    )
+
+    assert plan.padded_query_heads == 32
+    assert plan.padded_kv_heads == 8
+    assert plan.padded_query_heads // plan.padded_kv_heads == plan.query_heads // plan.kv_heads
+
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

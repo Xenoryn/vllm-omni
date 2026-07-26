@@ -72,6 +72,31 @@ class TestParallelConfigPropagation:
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.mask_sp_padding is False
 
+    def test_functional_sp_backend_roundtrip(self):
+        pc = DiffusionParallelConfig(
+            ulysses_degree=2,
+            sp_communication_backend="functional",
+        )
+        od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
+        assert od.parallel_config.sp_communication_backend == "functional"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {
+                "ring_degree": 2,
+                "sp_communication_backend": "functional",
+            },
+            {
+                "allgather_degree": 2,
+                "sp_communication_backend": "functional",
+            },
+        ],
+    )
+    def test_functional_sp_backend_rejects_non_ulysses_modes(self, kwargs):
+        with pytest.raises(ValueError, match="pure Ulysses"):
+            DiffusionParallelConfig(**kwargs)
+
     def test_cfg_parallel_roundtrip(self):
         pc = DiffusionParallelConfig(cfg_parallel_size=2)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)

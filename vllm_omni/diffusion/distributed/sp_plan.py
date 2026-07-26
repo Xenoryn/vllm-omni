@@ -36,7 +36,7 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     import torch
@@ -69,6 +69,9 @@ class SequenceParallelConfig:
             sequences with limited memory/bandwidth.
         convert_to_fp32: Whether to convert output and LSE to float32 for
             numerical stability in ring attention.
+        communication_backend: Communication implementation used by attention
+            and output gathers. ``functional`` is graphable and currently
+            supports pure CUDA/NCCL Ulysses only.
 
     Note:
         ulysses_degree * ring_degree = sequence_parallel_size
@@ -79,6 +82,7 @@ class SequenceParallelConfig:
     ring_degree: int = 1
     allgather_degree: int = 1
     convert_to_fp32: bool = True
+    communication_backend: Literal["native", "functional"] = "native"
 
     # Internal state - populated by setup()
     _rank: int | None = None
@@ -93,6 +97,16 @@ class SequenceParallelConfig:
             raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring.")
         if self.ulysses_degree == self.ring_degree == self.allgather_degree == 1:
             raise ValueError("At least one SP degree must be > 1.")
+        if self.communication_backend not in {"native", "functional"}:
+            raise ValueError("communication_backend must be 'native' or 'functional'.")
+        if self.communication_backend == "functional" and (
+            self.ulysses_degree <= 1 or self.ring_degree != 1 or self.allgather_degree != 1
+        ):
+            raise ValueError(
+                "communication_backend='functional' currently supports pure "
+                "Ulysses only (ulysses_degree > 1, ring_degree = "
+                "allgather_degree = 1)."
+            )
 
     @property
     def sequence_parallel_size(self) -> int:

@@ -7,7 +7,7 @@ import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import diffusers
 import torch
@@ -183,6 +183,14 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
+    sp_communication_backend: Literal["native", "functional"] = "native"
+    """Communication backend used by sequence-parallel attention.
+
+    - ``"native"`` uses imperative ``torch.distributed`` collectives.
+    - ``"functional"`` uses graphable tensor collectives. It currently
+      supports CUDA/NCCL Ulysses with evenly sharded sequence inputs.
+    """
+
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
@@ -255,6 +263,16 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
+        assert self.sp_communication_backend in {"native", "functional"}, (
+            "sp_communication_backend must be one of {'native','functional'}, "
+            f"but got {self.sp_communication_backend!r}."
+        )
+        if self.sp_communication_backend == "functional":
+            assert self.ulysses_degree > 1 and self.ring_degree == 1 and self.allgather_degree == 1, (
+                "sp_communication_backend='functional' currently supports pure "
+                "Ulysses only (ulysses_degree > 1, ring_degree = "
+                "allgather_degree = 1)."
+            )
 
         # Validate HSDP configuration
         if self.use_hsdp:

@@ -29,6 +29,8 @@ def build_parallel_attention_strategy(
     gather_idx: int,
     use_sync: bool,
     causal: bool = False,
+    num_heads: int | None = None,
+    num_kv_heads: int | None = None,
 ) -> ParallelAttentionStrategy:
     """Select a parallel attention strategy based on current diffusion config.
 
@@ -47,6 +49,7 @@ def build_parallel_attention_strategy(
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
+    communication_backend = getattr(p, "sp_communication_backend", "native")
 
     try:
         sp_group = get_sp_group()
@@ -77,12 +80,20 @@ def build_parallel_attention_strategy(
 
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:
+        if communication_backend == "functional" and ring_degree > 1:
+            raise ValueError(
+                "sp_communication_backend='functional' currently supports pure Ulysses only; set ring_degree=1."
+            )
         logger.debug(f"Using UlyssesParallelAttention (ulysses_degree={ulysses_degree})")
         return UlyssesParallelAttention(
             sp_group=sp_group,
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            mode=getattr(p, "ulysses_mode", "strict"),
+            communication_backend=communication_backend,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
         )
 
     # Pure Ring Attention

@@ -141,6 +141,8 @@ class Attention(nn.Module):
             gather_idx=gather_idx,
             use_sync=use_sync,
             causal=causal,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads or num_heads,
         )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
