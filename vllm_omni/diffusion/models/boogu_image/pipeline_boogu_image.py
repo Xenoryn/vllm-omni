@@ -285,7 +285,28 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         if parallel_config.tensor_parallel_size > 1:
             raise NotImplementedError("Tensor parallelism is not supported by BooguImagePipeline.")
         if (parallel_config.sequence_parallel_size or 1) > 1:
-            raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
+            if parallel_config.ring_degree > 1 or getattr(parallel_config, "allgather_degree", 1) > 1:
+                raise NotImplementedError(
+                    "BooguImagePipeline currently supports sequence parallelism through Ulysses only."
+                )
+            if parallel_config.ulysses_mode == "strict":
+                num_heads = self.od_config.tf_model_config.get(
+                    "num_attention_heads",
+                    24,
+                )
+                num_kv_heads = self.od_config.tf_model_config.get(
+                    "num_kv_heads",
+                    8,
+                )
+                if (
+                    num_heads % parallel_config.ulysses_degree != 0
+                    or num_kv_heads % parallel_config.ulysses_degree != 0
+                ):
+                    raise ValueError(
+                        "BooguImagePipeline GQA heads are not divisible by the "
+                        "configured Ulysses degree; set "
+                        "parallel_config.ulysses_mode='advanced_uaa'."
+                    )
         if parallel_config.cfg_parallel_size > 1:
             raise NotImplementedError("CFG parallelism is not supported by BooguImagePipeline.")
         if parallel_config.use_hsdp:

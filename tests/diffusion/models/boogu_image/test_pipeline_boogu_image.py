@@ -145,8 +145,7 @@ def test_constructor_weights_sources(boogu_pipeline):
     ("parallel_config", "cache_backend", "message"),
     [
         (DiffusionParallelConfig(tensor_parallel_size=2), "none", "Tensor parallelism"),
-        (DiffusionParallelConfig(ulysses_degree=2), "none", "Sequence parallelism"),
-        (DiffusionParallelConfig(ring_degree=2), "none", "Sequence parallelism"),
+        (DiffusionParallelConfig(ring_degree=2), "none", "Ulysses only"),
         (DiffusionParallelConfig(cfg_parallel_size=2), "none", "CFG parallelism"),
         (
             DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=2),
@@ -180,6 +179,55 @@ def test_constructor_rejects_unsupported_execution_modes(
 
     # Validation happens before any checkpoint component is constructed.
     mock_dependencies["mllm_wrapper"].model.to.assert_not_called()
+
+
+def test_constructor_accepts_graphable_ulysses_uaa(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(
+            params={
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+            }
+        ),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="advanced_uaa",
+            sp_communication_backend="functional",
+        ),
+    )
+
+    pipeline = BooguImagePipeline(od_config=od_config)
+    assert pipeline.transformer is mock_dependencies["transformer"]
+
+
+def test_constructor_requires_uaa_for_boogu_gqa(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(
+            params={
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+            }
+        ),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="strict",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="advanced_uaa"):
+        BooguImagePipeline(od_config=od_config)
 
 
 # ---------------------------------------------------------------------------
