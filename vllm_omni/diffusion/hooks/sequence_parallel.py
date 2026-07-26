@@ -50,7 +50,11 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
     SequenceParallelPartialInput,
 )
-from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
+from vllm_omni.diffusion.distributed.sp_sharding import (
+    SequenceShardMetadata,
+    sp_gather,
+    sp_shard,
+)
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 
 logger = init_logger(__name__)
@@ -173,6 +177,13 @@ class SequenceParallelSplitHook(ModelHook):
         self.module_forward_metadata: ModuleForwardMetadata | None = None
         # Cache for text lengths resolved from kwargs
         self._text_len_cache: dict[str, int] = {}
+        self._shard_groups = {
+            sp_input.shard_group
+            for value in metadata.values()
+            for sp_input in (value if isinstance(value, (list, tuple)) else (value,))
+            if isinstance(sp_input, SequenceParallelInput)
+            and sp_input.shard_group is not None
+        }
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         cls = _unwrap_module(module).__class__
@@ -184,6 +195,16 @@ class SequenceParallelSplitHook(ModelHook):
         args_list = list(args)
         # Clear text length cache for this forward pass
         self._text_len_cache.clear()
+        if self._shard_groups:
+            from vllm_omni.diffusion.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                for shard_group in self._shard_groups:
+                    ctx.sp_shard_metadata.pop(shard_group, None)
 
         for name, spm in self.metadata.items():
             # Skip if this is a split_output entry (handled in post_forward)
@@ -353,7 +374,11 @@ class SequenceParallelSplitHook(ModelHook):
         if isinstance(sp_input, SequenceParallelInput):
             # Full split with optional auto-padding
             if sp_input.auto_pad:
-                return self._shard_with_auto_pad(x, sp_input.split_dim)
+                return self._shard_with_auto_pad(
+                    x,
+                    sp_input.split_dim,
+                    sp_input.shard_group,
+                )
             _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
             return sp_shard(x, sp_input.split_dim, validate=False)
         elif isinstance(sp_input, SequenceParallelPartialInput):
@@ -374,7 +399,12 @@ class SequenceParallelSplitHook(ModelHook):
         else:
             raise ValueError(f"Unsupported input config type: {type(sp_input).__name__}")
 
-    def _shard_with_auto_pad(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+    def _shard_with_auto_pad(
+        self,
+        x: torch.Tensor,
+        dim: int,
+        shard_group: str | None,
+    ) -> torch.Tensor:
         """Shard tensor with automatic padding and attention mask creation.
 
         When sequence length is not divisible by SP world size, this method:
@@ -395,10 +425,28 @@ class SequenceParallelSplitHook(ModelHook):
             return x
 
         seq_len = x.size(dim)
+        rank = get_sequence_parallel_rank()
+        shard_metadata = SequenceShardMetadata.from_global_length(
+            seq_len,
+            world_size=world_size,
+            rank=rank,
+        )
         remainder = seq_len % world_size
 
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            if shard_group is not None:
+                existing = ctx.sp_shard_metadata.get(shard_group)
+                if existing is not None and existing != shard_metadata:
+                    raise ValueError(
+                        f"All tensors in shard_group={shard_group!r} must have "
+                        "the same global sequence length and shard layout, but "
+                        f"got {existing} and {shard_metadata}."
+                    )
+                ctx.sp_shard_metadata[shard_group] = shard_metadata
+
         if remainder == 0:
-            # No padding needed
+            # Keyed groups record metadata even when no padding is necessary.
             return sp_shard(x, dim, validate=False)
 
         # Check backend compatibility
@@ -429,8 +477,8 @@ class SequenceParallelSplitHook(ModelHook):
             )
 
         # Calculate padding
-        pad_size = world_size - remainder
-        padded_seq_len = seq_len + pad_size
+        pad_size = shard_metadata.padding_size
+        padded_seq_len = shard_metadata.padded_seq_len
 
         # Pad the tensor
         pad_shape = list(x.shape)
@@ -452,7 +500,6 @@ class SequenceParallelSplitHook(ModelHook):
                 )
 
         # Shard the padded tensor
-        rank = get_sequence_parallel_rank()
         return x_padded.chunk(world_size, dim=dim)[rank]
 
 
@@ -496,12 +543,6 @@ class SequenceParallelGatherHook(ModelHook):
         if len(output) != len(self.metadata):
             raise ValueError(f"Expected {len(self.metadata)} outputs, got {len(output)}.")
 
-        # Check if padding was applied during split
-        original_seq_len = None
-        if is_forward_context_available():
-            ctx = get_forward_context()
-            original_seq_len = ctx.sp_original_seq_len
-
         actually_gathered = False
 
         for i, spm in enumerate(self.metadata):
@@ -519,6 +560,19 @@ class SequenceParallelGatherHook(ModelHook):
             gathered = sp_gather(x, spm.gather_dim, validate=False)
 
             # Remove padding if it was applied
+            original_seq_len = None
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                if spm.shard_group is None:
+                    original_seq_len = ctx.sp_original_seq_len
+                else:
+                    shard_metadata = ctx.sp_shard_metadata.get(spm.shard_group)
+                    if shard_metadata is None:
+                        raise RuntimeError(
+                            f"No SP shard metadata was registered for "
+                            f"shard_group={spm.shard_group!r}."
+                        )
+                    original_seq_len = shard_metadata.original_seq_len
             if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
                 gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
                 logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")

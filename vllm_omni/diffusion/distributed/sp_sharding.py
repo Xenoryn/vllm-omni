@@ -24,6 +24,121 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class SequenceShardMetadata:
+    """Static metadata for one globally padded sequence shard.
+
+    A shard group identifies tensors that represent the same global sequence
+    (for example, hidden states, mask, and RoPE tensors). All tensors in a
+    group are padded and split identically.
+    """
+
+    original_seq_len: int
+    padded_seq_len: int
+    world_size: int
+    rank: int
+    local_seq_len: int
+
+    def __post_init__(self) -> None:
+        if self.original_seq_len < 0:
+            raise ValueError("original_seq_len must be non-negative.")
+        if self.world_size < 1:
+            raise ValueError("world_size must be >= 1.")
+        if self.rank < 0 or self.rank >= self.world_size:
+            raise ValueError(f"rank must be in [0, {self.world_size}), got {self.rank}.")
+        if self.padded_seq_len < self.original_seq_len:
+            raise ValueError("padded_seq_len must be >= original_seq_len.")
+        if self.padded_seq_len % self.world_size != 0:
+            raise ValueError("padded_seq_len must be divisible by world_size.")
+        if self.local_seq_len != self.padded_seq_len // self.world_size:
+            raise ValueError("local_seq_len must equal padded_seq_len // world_size.")
+
+    @classmethod
+    def from_global_length(
+        cls,
+        original_seq_len: int,
+        *,
+        world_size: int,
+        rank: int,
+    ) -> SequenceShardMetadata:
+        """Build metadata for an evenly padded shard of a global sequence."""
+        if original_seq_len < 0:
+            raise ValueError("original_seq_len must be non-negative.")
+        if world_size < 1:
+            raise ValueError("world_size must be >= 1.")
+        padded_seq_len = ((original_seq_len + world_size - 1) // world_size) * world_size
+        return cls(
+            original_seq_len=original_seq_len,
+            padded_seq_len=padded_seq_len,
+            world_size=world_size,
+            rank=rank,
+            local_seq_len=padded_seq_len // world_size,
+        )
+
+    @classmethod
+    def identity(cls, seq_len: int) -> SequenceShardMetadata:
+        """Build metadata for a non-sharded sequence."""
+        return cls.from_global_length(seq_len, world_size=1, rank=0)
+
+    @property
+    def padding_size(self) -> int:
+        return self.padded_seq_len - self.original_seq_len
+
+    @property
+    def local_start(self) -> int:
+        return self.rank * self.local_seq_len
+
+    @property
+    def local_end(self) -> int:
+        return self.local_start + self.local_seq_len
+
+    def local_valid_length(self, global_valid_length: int) -> int:
+        """Return this rank's valid prefix length for a global prefix."""
+        if global_valid_length < 0 or global_valid_length > self.original_seq_len:
+            raise ValueError(
+                f"global_valid_length must be in [0, {self.original_seq_len}], "
+                f"got {global_valid_length}."
+            )
+        return max(
+            0,
+            min(global_valid_length, self.local_end) - self.local_start,
+        )
+
+    def local_valid_lengths(self, global_valid_lengths: list[int]) -> list[int]:
+        """Vectorized :meth:`local_valid_length` for batched prefix lengths."""
+        return [self.local_valid_length(int(length)) for length in global_valid_lengths]
+
+    def local_segment_lengths(
+        self,
+        global_segment_lengths: list[list[int]],
+    ) -> list[list[int]]:
+        """Intersect contiguous per-sample segments with this rank's shard."""
+        local_lengths: list[list[int]] = []
+        for sample_lengths in global_segment_lengths:
+            if any(int(length) < 0 for length in sample_lengths):
+                raise ValueError("Segment lengths must be non-negative.")
+            if sum(int(length) for length in sample_lengths) > self.original_seq_len:
+                raise ValueError(
+                    "The sum of segment lengths cannot exceed original_seq_len "
+                    f"({self.original_seq_len})."
+                )
+
+            sample_local: list[int] = []
+            segment_start = 0
+            for length in sample_lengths:
+                segment_end = segment_start + int(length)
+                sample_local.append(
+                    max(
+                        0,
+                        min(segment_end, self.local_end)
+                        - max(segment_start, self.local_start),
+                    )
+                )
+                segment_start = segment_end
+            local_lengths.append(sample_local)
+        return local_lengths
+
+
 def sp_shard(
     tensor: torch.Tensor,
     dim: int,
