@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, overload
 
 import torch
 import vllm.ir
@@ -15,6 +15,10 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
     import torch
+
+    from vllm_omni.diffusion.distributed.sp_sharding import (
+        SequenceShardMetadata,
+    )
 
 
 @dataclass
@@ -39,6 +43,9 @@ class ForwardContext:
     sp_padding_size: int = 0
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
+    # Independent padding/sharding metadata keyed by SequenceParallelInput
+    # shard_group. The singleton fields above remain for backward compatibility.
+    sp_shard_metadata: dict[str, SequenceShardMetadata] = field(default_factory=dict)
 
     # Set by registry when _sp_plan hooks are applied.
     # When True, sp_active is determined by _sp_shard_depth (for _sp_plan hooks)
@@ -48,6 +55,10 @@ class ForwardContext:
     # Tracks the depth of SP sharding - incremented on shard, decremented on gather
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
+    # Each active SP split boundary records whether it guarantees identical
+    # rank-local sequence extents. Auto-padded boundaries provide this contract,
+    # allowing attention collectives to avoid a runtime length all-gather.
+    _sp_equal_rank_seq_len_stack: list[bool] = field(default_factory=list)
 
     @property
     def sp_active(self) -> bool:
@@ -70,6 +81,15 @@ class ForwardContext:
         sp_size = self.omni_diffusion_config.parallel_config.sequence_parallel_size
         return sp_size is not None and sp_size > 1
 
+    @property
+    def sp_rank_local_seq_lens_equal(self) -> bool:
+        """Whether active SP boundaries guarantee equal local sequence sizes.
+
+        The guarantee is deliberately scoped to framework-managed SP regions.
+        Callers that shard tensors manually retain the dynamic length exchange.
+        """
+        return bool(self._sp_equal_rank_seq_len_stack) and all(self._sp_equal_rank_seq_len_stack)
+
     def __post_init__(self):
         pass
 
@@ -87,6 +107,42 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context is not None
+
+
+@overload
+def get_sp_shard_metadata(
+    shard_group: str,
+    *,
+    default_seq_len: int,
+) -> SequenceShardMetadata: ...
+
+
+@overload
+def get_sp_shard_metadata(
+    shard_group: str,
+    *,
+    default_seq_len: None = None,
+) -> SequenceShardMetadata | None: ...
+
+
+def get_sp_shard_metadata(
+    shard_group: str,
+    *,
+    default_seq_len: int | None = None,
+) -> SequenceShardMetadata | None:
+    """Get keyed SP shard metadata, optionally falling back to identity."""
+    if is_forward_context_available():
+        metadata = get_forward_context().sp_shard_metadata.get(shard_group)
+        if metadata is not None:
+            return metadata
+    if default_seq_len is None:
+        return None
+
+    from vllm_omni.diffusion.distributed.sp_sharding import (
+        SequenceShardMetadata,
+    )
+
+    return SequenceShardMetadata.identity(default_seq_len)
 
 
 def build_local_sp_padding_mask(

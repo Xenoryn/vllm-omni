@@ -114,6 +114,47 @@ class TestSequenceParallelPlanValidation:
         with pytest.raises(ValueError, match="split_output=True"):
             validate_sp_plan(plan)
 
+    def test_keyed_metadata_requires_auto_pad(self):
+        plan = {
+            "prepare": {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    split_output=True,
+                    shard_group="image",
+                ),
+            },
+            "output": SequenceParallelOutput(
+                gather_dim=1,
+                shard_group="image",
+            ),
+        }
+
+        with pytest.raises(ValueError, match="requires auto_pad=True"):
+            validate_sp_plan(plan)
+
+    def test_shard_group_is_scoped_to_one_split_boundary(self):
+        plan = {
+            "prepare_image": {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    split_output=True,
+                    auto_pad=True,
+                    shard_group="image",
+                ),
+            },
+            "prepare_rope": {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    split_output=True,
+                    auto_pad=True,
+                    shard_group="image",
+                ),
+            },
+        }
+
+        with pytest.raises(ValueError, match="multiple split boundaries"):
+            validate_sp_plan(plan)
+
 
 @pytest.mark.cpu
 class TestGetSpPlanFromModel:
@@ -1026,6 +1067,160 @@ class TestStrictModeSplitValidation:
         with set_forward_context(omni_diffusion_config=od_config):
             with pytest.raises(ValueError, match=r"strict mode.*sequence_parallel_size"):
                 hook._prepare_sp_input(x, metadata["x"], (), {})
+
+
+@pytest.mark.cpu
+class TestKeyedSequenceShardMetadata:
+    def test_local_prefix_and_segment_lengths(self):
+        from vllm_omni.diffusion.distributed.sp_sharding import (
+            SequenceShardMetadata,
+        )
+
+        rank_zero = SequenceShardMetadata.from_global_length(
+            5,
+            world_size=2,
+            rank=0,
+        )
+        rank_one = SequenceShardMetadata.from_global_length(
+            5,
+            world_size=2,
+            rank=1,
+        )
+
+        assert rank_zero.padded_seq_len == 6
+        assert rank_zero.local_valid_lengths([5, 2]) == [3, 2]
+        assert rank_one.local_valid_lengths([5, 2]) == [2, 0]
+        assert rank_zero.local_segment_lengths([[2, 3]]) == [[2, 1]]
+        assert rank_one.local_segment_lengths([[2, 3]]) == [[0, 2]]
+
+    def test_auto_pad_registers_equal_rank_contract(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from vllm_omni.diffusion.attention import selector
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import (
+            SequenceParallelConfig,
+        )
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
+
+        class MaskBackend:
+            supports_attention_mask = True
+
+            @staticmethod
+            def get_name():
+                return "test"
+
+        monkeypatch.setattr(
+            parallel_state,
+            "get_sequence_parallel_world_size",
+            lambda: 2,
+        )
+        monkeypatch.setattr(
+            parallel_state,
+            "get_sequence_parallel_rank",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            parallel_state,
+            "get_ring_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            selector,
+            "get_attn_backend_for_role",
+            lambda **_: (MaskBackend(), None),
+        )
+
+        hook = SequenceParallelSplitHook(
+            {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    expected_dims=3,
+                    split_output=True,
+                    auto_pad=True,
+                    shard_group="image",
+                )
+            },
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+        hook.initialize_hook(nn.Identity())
+
+        with set_forward_context():
+            hook.pre_forward(nn.Identity())
+            shard = hook.post_forward(
+                nn.Identity(),
+                torch.arange(5).reshape(1, 5, 1),
+            )
+            ctx = get_forward_context()
+
+            assert shard.shape[1] == 3
+            assert ctx.sp_rank_local_seq_lens_equal
+            assert ctx.sp_shard_metadata["image"].original_seq_len == 5
+
+    def test_gather_trims_keyed_padding_and_closes_contract(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from vllm_omni.diffusion.distributed.sp_plan import (
+            SequenceParallelConfig,
+        )
+        from vllm_omni.diffusion.distributed.sp_sharding import (
+            SequenceShardMetadata,
+        )
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+        from vllm_omni.diffusion.hooks import sequence_parallel
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelGatherHook,
+        )
+
+        monkeypatch.setattr(
+            sequence_parallel,
+            "sp_gather",
+            lambda tensor, dim, validate: torch.cat([tensor, tensor], dim=dim),
+        )
+        hook = SequenceParallelGatherHook(
+            SequenceParallelOutput(
+                gather_dim=1,
+                expected_dims=3,
+                shard_group="image",
+            ),
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+
+        with set_forward_context():
+            ctx = get_forward_context()
+            ctx.sp_shard_metadata["image"] = SequenceShardMetadata.from_global_length(
+                5,
+                world_size=2,
+                rank=0,
+            )
+            ctx.sp_shard_metadata["context"] = SequenceShardMetadata.from_global_length(
+                7,
+                world_size=2,
+                rank=0,
+            )
+            ctx._sp_shard_depth = 3
+            ctx._sp_equal_rank_seq_len_stack.extend([True, True, True])
+            output = hook.post_forward(
+                nn.Identity(),
+                torch.zeros(1, 3, 4),
+            )
+
+            assert output.shape == (1, 5, 4)
+            assert not ctx.sp_rank_local_seq_lens_equal
+            assert ctx._sp_equal_rank_seq_len_stack == []
+            assert ctx.sp_shard_metadata == {}
+            assert ctx._sp_shard_depth == 0
 
 
 @pytest.mark.cpu
