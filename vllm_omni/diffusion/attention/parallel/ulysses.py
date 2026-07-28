@@ -13,7 +13,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
-from vllm_omni.diffusion.forward_context import get_ulysses_mode
+from vllm_omni.diffusion.forward_context import get_forward_context, get_ulysses_mode
 
 
 def _ceil_div(n: int, d: int) -> int:
@@ -55,6 +55,7 @@ def _ulysses_all_to_all_any_qkv(
     *,
     seq_lens: list[int],
     use_sync: bool,
+    padded_head_cnt: int | None = None,
 ) -> tuple[torch.Tensor, int]:
     """UAA forward all-to-all: (B, S_local, H, D) -> (B, S_global, H_local, D).
 
@@ -67,7 +68,12 @@ def _ulysses_all_to_all_any_qkv(
 
     bsz, s_local, head_cnt, head_dim = x.shape
     orig_head_cnt = int(head_cnt)
-    padded_head_cnt = _ceil_div(orig_head_cnt, world_size) * world_size
+    if padded_head_cnt is None:
+        padded_head_cnt = _ceil_div(orig_head_cnt, world_size) * world_size
+    if padded_head_cnt < orig_head_cnt or padded_head_cnt % world_size != 0:
+        raise ValueError(
+            f"Invalid padded head count {padded_head_cnt} for original heads={orig_head_cnt}, world_size={world_size}."
+        )
     head_pad = padded_head_cnt - orig_head_cnt
     if head_pad:
         x = F.pad(x, (0, 0, 0, head_pad))
@@ -81,7 +87,7 @@ def _ulysses_all_to_all_any_qkv(
 
     input_split_sizes = [s_local] * world_size
     output_split_sizes = seq_lens
-    s_global = int(sum(output_split_sizes))
+    s_global = sum(output_split_sizes)
 
     out = torch.empty((s_global, bsz, head_cnt_local, head_dim), device=x.device, dtype=x.dtype)
     dist.all_to_all_single(
@@ -116,7 +122,7 @@ def _ulysses_all_to_all_any_o(
         return x
 
     bsz, s_global, head_cnt_local, head_dim = x.shape
-    s_local = int(local_seq_len)
+    s_local = local_seq_len
 
     # (B, S_global, H_local, D) -> (S_global, B, H_local, D)
     x_t = x.permute(1, 0, 2, 3).contiguous()
@@ -204,6 +210,7 @@ class UlyssesParallelAttention:
         attn_metadata: AttentionMetadata | None,
     ):
         mode = get_ulysses_mode(default="strict")
+        input_local_seq_len = query.shape[1]
         joint_tensor_query = joint_tensor_key = joint_tensor_value = None
         joint_strategy = "front"
         joint_len = 0
@@ -294,9 +301,20 @@ class UlyssesParallelAttention:
                     f"(got scatter_idx={self._scatter_idx}, gather_idx={self._gather_idx})."
                 )
 
-            local_seq_len = int(query.shape[1])
-            seq_lens = _all_gather_int(self._ulysses_pg, local_seq_len, device=query.device)
-            s_global = int(sum(seq_lens))
+            rank_seq_lens_equal = get_forward_context().sp_rank_local_seq_lens_equal
+            if rank_seq_lens_equal:
+                # auto_pad guarantees equal extents; keep the shape symbolic to
+                # avoid the host sync and graph break of a length all-gather.
+                local_seq_len = query.shape[1]
+                seq_lens = [local_seq_len] * ulysses_world_size
+            else:
+                local_seq_len = int(query.shape[1])
+                seq_lens = _all_gather_int(
+                    self._ulysses_pg,
+                    local_seq_len,
+                    device=query.device,
+                )
+            s_global = sum(seq_lens)
 
             # In hybrid Ulysses+Ring, Ring attention uses P2P send/recv with fixed-shape
             # buffers. This requires all ring ranks to have the same seq_len after the
@@ -311,12 +329,48 @@ class UlyssesParallelAttention:
                         "This typically means the input sequence was not evenly shardable across the ring. "
                         "Try setting ring_degree=1, or choose a sequence length divisible by ring_degree."
                     )
+
+            query_head_cnt = int(query.shape[2])
+            kv_head_cnt = int(key.shape[2])
+            value_head_cnt = int(value.shape[2])
+            if (
+                query_head_cnt <= 0
+                or kv_head_cnt <= 0
+                or value_head_cnt != kv_head_cnt
+                or query_head_cnt % kv_head_cnt != 0
+            ):
+                raise ValueError(
+                    "Ulysses GQA requires equal K/V head counts and query heads "
+                    f"to be a multiple of KV heads, got Q={query_head_cnt}, "
+                    f"K={kv_head_cnt}, V={value_head_cnt}."
+                )
+            # Pad KV first, then derive Q capacity to preserve the GQA ratio.
+            padded_kv_head_cnt = _ceil_div(kv_head_cnt, ulysses_world_size) * ulysses_world_size
+            padded_query_head_cnt = padded_kv_head_cnt * (query_head_cnt // kv_head_cnt)
+
             query, orig_head_cnt = _ulysses_all_to_all_any_qkv(
-                self._ulysses_pg, query, seq_lens=seq_lens, use_sync=self._use_sync
+                self._ulysses_pg,
+                query,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_query_head_cnt,
             )
-            key, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, key, seq_lens=seq_lens, use_sync=self._use_sync)
-            value, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, value, seq_lens=seq_lens, use_sync=self._use_sync)
+            key, _ = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg,
+                key,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_kv_head_cnt,
+            )
+            value, _ = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg,
+                value,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_kv_head_cnt,
+            )
         else:
+            rank_seq_lens_equal = True
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):
                 head_cnt = int(t.shape[2])
@@ -359,6 +413,56 @@ class UlyssesParallelAttention:
                 key = torch.cat([key, joint_tensor_key], dim=1)
                 value = torch.cat([value, joint_tensor_value], dim=1)
 
+        if (
+            not is_joint
+            and attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and attn_metadata.attn_mask.ndim == 2
+        ):
+            mask = attn_metadata.attn_mask
+            if mask.shape[1] == query.shape[1]:
+                # Some existing adapters (for example ERNIE-Image) keep the
+                # already-padded global mask replicated while sharding Q/K/V.
+                pass
+            elif mask.shape[1] == input_local_seq_len:
+                local_mask = mask.contiguous()
+                if rank_seq_lens_equal:
+                    gathered_masks = [torch.empty_like(local_mask) for _ in range(ulysses_world_size)]
+                    dist.all_gather(gathered_masks, local_mask, group=self._ulysses_pg)
+                else:
+                    local_seq_len_int = int(local_mask.shape[1])
+                    ulysses_rank = self._sp_group.ulysses_rank
+                    if local_seq_len_int != seq_lens[ulysses_rank]:
+                        raise ValueError(
+                            "The rank-local attention mask length must match the "
+                            "rank-local query length, but got "
+                            f"mask_len={local_seq_len_int}, "
+                            f"query_len={seq_lens[ulysses_rank]}."
+                        )
+                    max_seq_len = max(seq_lens)
+                    padded_mask = F.pad(
+                        local_mask,
+                        (0, max_seq_len - local_seq_len_int),
+                    ).contiguous()
+                    padded_masks = [torch.empty_like(padded_mask) for _ in range(ulysses_world_size)]
+                    dist.all_gather(padded_masks, padded_mask, group=self._ulysses_pg)
+                    gathered_masks = [
+                        rank_mask[:, :rank_seq_len]
+                        for rank_mask, rank_seq_len in zip(
+                            padded_masks,
+                            seq_lens,
+                            strict=True,
+                        )
+                    ]
+                attn_metadata.attn_mask = torch.cat(gathered_masks, dim=1)
+            else:
+                raise ValueError(
+                    "A 2D Ulysses attention mask must describe either the "
+                    "rank-local or global sequence, but got "
+                    f"mask_len={mask.shape[1]}, local_query_len={input_local_seq_len}, "
+                    f"global_query_len={query.shape[1]}."
+                )
+
         ctx = _UlyssesCtx(
             name=self.name,
             ulysses_pg=self._ulysses_pg,
@@ -368,8 +472,8 @@ class UlyssesParallelAttention:
             joint_len=joint_len,
             joint_strategy=joint_strategy,
             use_uaa=(mode == "advanced_uaa"),
-            uaa_seq_lens=tuple(int(x) for x in seq_lens) if mode == "advanced_uaa" else (),
-            uaa_local_seq_len=int(local_seq_len) if mode == "advanced_uaa" else 0,
+            uaa_seq_lens=tuple(seq_lens) if mode == "advanced_uaa" else (),
+            uaa_local_seq_len=local_seq_len if mode == "advanced_uaa" else 0,
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
         )
