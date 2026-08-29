@@ -229,21 +229,9 @@ class UlyssesParallelAttention:
         ulysses_world_size = self._sp_group.ulysses_world_size
 
         # advanced_uaa pads non-divisible head counts before the Ulysses
-        # all-to-all. Padding K/V is not valid in hybrid Ulysses+Ring: the Ring
-        # GQA/MQA path would repeat the padded zero heads as real K/V heads.
-        # Reject this layout until K/V replication is performed before Ulysses.
-        if mode == "advanced_uaa" and self._sp_group.ring_world_size > 1:
-            for name, tensor in (("key", key), ("value", value)):
-                kv_head_cnt = int(tensor.shape[2])
-                if kv_head_cnt % ulysses_world_size != 0:
-                    raise ValueError(
-                        "ulysses_mode='advanced_uaa' with hybrid Ulysses+Ring "
-                        "does not support K/V head padding. "
-                        f"{name}_head_cnt={kv_head_cnt}, "
-                        f"ulysses_degree={ulysses_world_size}. "
-                        "Use ring_degree=1, choose a compatible ulysses_degree, "
-                        "or replicate K/V heads before Ulysses."
-                    )
+        # all-to-all. This also holds in hybrid Ulysses+Ring: Q is derived
+        # from the padded K/V count by the GQA ratio (see below), so padded
+        # heads pair with padded heads; non-GQA layouts are rejected below.
 
         joint_tensor_query = joint_tensor_key = joint_tensor_value = None
         joint_strategy = "front"

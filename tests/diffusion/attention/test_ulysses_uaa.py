@@ -210,28 +210,36 @@ def test_uaa_rejects_joint_head_counts_that_are_not_a_gqa_shape(
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_advanced_uaa_hybrid_rejects_padded_mqa_heads(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.attention.parallel.ulysses.get_ulysses_mode",
-        lambda default: "advanced_uaa",
-    )
+def test_advanced_uaa_hybrid_rejects_non_gqa_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hybrid Ulysses+Ring still rejects shapes that are not a GQA shape.
+
+    Valid GQA shapes are safe under advanced_uaa head padding (the derived-Q
+    rule keeps real Q heads paired with real K/V heads after the split, see
+    pre_attention), but a query count that is not a multiple of the K/V count
+    cannot be padded while preserving the ratio, so it must be rejected.
+    """
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
     sp_group = SimpleNamespace(
         ulysses_group=None,
         ulysses_world_size=2,
         ulysses_rank=0,
         ring_world_size=2,
+        ring_group=object(),
     )
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    monkeypatch.setattr(ulysses, "_all_gather_int", lambda *args, **kwargs: [3, 3])
     strategy = UlyssesParallelAttention(
         sp_group=sp_group,
         scatter_idx=2,
         gather_idx=1,
         use_sync=False,
     )
-    query = torch.zeros(1, 2, 8, 4)
-    key = torch.zeros(1, 2, 1, 4)
+    query = torch.zeros(1, 2, 10, 4)
+    key = torch.zeros(1, 2, 4, 4)
     value = torch.zeros_like(key)
 
-    with pytest.raises(ValueError, match="does not support K/V head padding"):
+    with pytest.raises(ValueError, match="multiple of KV heads"):
         strategy.pre_attention(query, key, value, None)
 
 
@@ -503,7 +511,17 @@ def test_ulysses_uaa_matches_baseline(
                 pass
 
 
-def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,joint_len",
+    [
+        (3, None, None),  # MHA baseline (head_cnt not divisible by ulysses_degree=2)
+        (28, 7, None),  # GQA: exercises Ring pytorch_attn_forward KV expansion (Q!=K heads)
+        (28, 7, 5),  # GQA + MMDiT joint stream: joint K/V ride the padded Ulysses layout and Ring SDPA
+    ],
+)
+def test_ulysses_uaa_hybrid_ring_matches_baseline(
+    num_heads: int, num_kv_heads: int | None, joint_len: int | None
+) -> None:
     sp_world_size = 4
     ulysses_degree = 2
     ring_degree = 2
@@ -514,9 +532,8 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
     batch_size = 2
     head_size = 8
     seq_len = 10
-    # This is the positive Hybrid case: K/V heads must not require padding,
-    # which is unsupported by advanced_uaa when Ring is also enabled.
-    num_heads = 4
+    kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+    has_joint = joint_len is not None
 
     # Ensure ring ranks see equal post-Ulysses seq_len:
     # rank0/1 -> 3+2=5, rank2/3 -> 3+2=5
@@ -535,9 +552,14 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
     try:
         torch.manual_seed(0)
         q = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
-        k = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
-        v = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
-        np.savez(input_file, q=q.numpy(), k=k.numpy(), v=v.numpy())
+        k = torch.randn(batch_size, seq_len, kv_heads, head_size, dtype=torch.float32)
+        v = torch.randn(batch_size, seq_len, kv_heads, head_size, dtype=torch.float32)
+        payload = {"q": q.numpy(), "k": k.numpy(), "v": v.numpy()}
+        if has_joint:
+            payload["joint_q"] = torch.randn(batch_size, joint_len, num_heads, head_size, dtype=torch.float32).numpy()
+            payload["joint_k"] = torch.randn(batch_size, joint_len, kv_heads, head_size, dtype=torch.float32).numpy()
+            payload["joint_v"] = torch.randn(batch_size, joint_len, kv_heads, head_size, dtype=torch.float32).numpy()
+        np.savez(input_file, **payload)
 
         # Baseline (no SP)
         torch.multiprocessing.spawn(
@@ -554,6 +576,8 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
                 1,
                 None,
                 "mem_efficient",
+                num_kv_heads,
+                has_joint,
             ),
             nprocs=1,
         )
@@ -573,6 +597,8 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
                 ring_degree,
                 split_sizes,
                 "mem_efficient",
+                num_kv_heads,
+                has_joint,
             ),
             nprocs=sp_world_size,
         )
