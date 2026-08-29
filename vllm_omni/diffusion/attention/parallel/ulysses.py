@@ -268,32 +268,54 @@ class UlyssesParallelAttention:
             # Slice joint_query for this Ulysses rank
             # joint_query is (B, S, H, D). We split H (dim 2).
             ulysses_rank = self._sp_group.ulysses_rank
-            joint_head_cnt = int(joint_tensor_query.shape[-2])
-            joint_orig_head_cnt = joint_head_cnt
+            joint_q_head_cnt = int(joint_tensor_query.shape[-2])
+            joint_k_head_cnt = int(joint_tensor_key.shape[-2])
+            joint_v_head_cnt = int(joint_tensor_value.shape[-2])
+            joint_orig_head_cnt = joint_q_head_cnt
+
+            if joint_k_head_cnt != joint_v_head_cnt or joint_q_head_cnt % joint_k_head_cnt != 0:
+                raise ValueError(
+                    "Ulysses joint attention requires equal K/V head counts and joint query "
+                    "heads to be a multiple of joint KV heads, got "
+                    f"joint_Q={joint_q_head_cnt}, joint_K={joint_k_head_cnt}, joint_V={joint_v_head_cnt}."
+                )
 
             if mode == "advanced_uaa":
-                padded_joint_head_cnt = _ceil_div(joint_head_cnt, ulysses_world_size) * ulysses_world_size
-                joint_head_pad = padded_joint_head_cnt - joint_head_cnt
-                if joint_head_pad:
-                    joint_tensor_query = F.pad(joint_tensor_query, (0, 0, 0, joint_head_pad))
-                    joint_tensor_key = F.pad(joint_tensor_key, (0, 0, 0, joint_head_pad))
-                    joint_tensor_value = F.pad(joint_tensor_value, (0, 0, 0, joint_head_pad))
-                joint_head_cnt = padded_joint_head_cnt
+                # Pad joint KV to a world_size multiple, then derive joint Q by the
+                # GQA ratio so the ratio survives the head-dim split (mirrors the
+                # main-tensor path below; e.g. 28Q/7KV at SP2 becomes 32/8).
+                padded_joint_kv_head_cnt = _ceil_div(joint_k_head_cnt, ulysses_world_size) * ulysses_world_size
+                gqa_ratio = joint_q_head_cnt // joint_k_head_cnt
+                padded_joint_q_head_cnt = padded_joint_kv_head_cnt * gqa_ratio
+
+                joint_q_pad = padded_joint_q_head_cnt - joint_q_head_cnt
+                joint_kv_pad = padded_joint_kv_head_cnt - joint_k_head_cnt
+                if joint_q_pad:
+                    joint_tensor_query = F.pad(joint_tensor_query, (0, 0, 0, joint_q_pad))
+                if joint_kv_pad:
+                    joint_tensor_key = F.pad(joint_tensor_key, (0, 0, 0, joint_kv_pad))
+                    joint_tensor_value = F.pad(joint_tensor_value, (0, 0, 0, joint_kv_pad))
+                joint_q_head_cnt = padded_joint_q_head_cnt
+                joint_k_head_cnt = padded_joint_kv_head_cnt
             else:
-                if joint_head_cnt % ulysses_world_size != 0:
-                    supported = _positive_divisors(joint_head_cnt)
-                    raise ValueError(
-                        "Ulysses-SP strict mode requires joint head_cnt divisible by ulysses_degree. "
-                        f"joint_head_cnt={joint_head_cnt}, ulysses_degree={ulysses_world_size}. "
-                        f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
-                    )
+                for name, cnt in (
+                    ("joint_query", joint_q_head_cnt),
+                    ("joint_key", joint_k_head_cnt),
+                    ("joint_value", joint_v_head_cnt),
+                ):
+                    if cnt % ulysses_world_size != 0:
+                        supported = _positive_divisors(cnt)
+                        raise ValueError(
+                            "Ulysses-SP strict mode requires joint head_cnt divisible by ulysses_degree. "
+                            f"{name}_head_cnt={cnt}, ulysses_degree={ulysses_world_size}. "
+                            f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
+                        )
 
-            attn_heads_per_ulysses_rank = joint_head_cnt // ulysses_world_size
+            attn_heads_per_ulysses_rank_q = joint_q_head_cnt // ulysses_world_size
 
-            # Note: We use the same heads for Q/K/V
             joint_tensor_query = joint_tensor_query[
                 ...,
-                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
+                attn_heads_per_ulysses_rank_q * ulysses_rank : attn_heads_per_ulysses_rank_q * (ulysses_rank + 1),
                 :,
             ]
 
@@ -307,8 +329,9 @@ class UlyssesParallelAttention:
 
         if is_joint:
             # Slice joint key/value heads for this ulysses rank.
-            # Using same slicing logic as query
-            attn_heads_per_ulysses_rank_kv = joint_tensor_key.shape[-2] // ulysses_world_size
+            # Using the KV head count (post-pad in advanced_uaa) so the per-rank
+            # KV shape matches the main K/V slice and preserves the GQA ratio.
+            attn_heads_per_ulysses_rank_kv = joint_k_head_cnt // ulysses_world_size
 
             joint_tensor_key = joint_tensor_key[
                 ...,
