@@ -29,6 +29,202 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_uaa_equal_rank_contract_skips_length_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    observed = []
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        observed.append((kwargs["seq_lens"], kwargs["padded_head_cnt"]))
+        return tensor, tensor.shape[2]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    monkeypatch.setattr(
+        ulysses,
+        "_all_gather_int",
+        lambda *args, **kwargs: pytest.fail("length gather must be skipped"),
+    )
+    strategy = ulysses.UlyssesParallelAttention(
+        FakeGroup(),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        get_forward_context()._sp_equal_pad_stack.append(True)
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    assert observed == [([3, 3], 32), ([3, 3], 8), ([3, 3], 8)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_uaa_hybrid_equal_rank_contract_skips_ulysses_gather_keeps_ring_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract + ring: the fast path skips only the Ulysses gather.
+
+    The ring equality check is a separate collective on ring_group and must
+    still run, receiving s_global derived from the contract.
+    """
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ring_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 2
+
+    sp_group = FakeGroup()
+    observed = []
+    ring_checks = []
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        observed.append((kwargs["seq_lens"], kwargs["padded_head_cnt"]))
+        return tensor, tensor.shape[2]
+
+    def fake_gather_int(pg, value, *, device):
+        if pg is sp_group.ulysses_group:
+            pytest.fail("Ulysses length gather must be skipped under the contract")
+        assert pg is sp_group.ring_group
+        ring_checks.append(int(value))
+        return [int(value), int(value)]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    monkeypatch.setattr(ulysses, "_all_gather_int", fake_gather_int)
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    strategy = ulysses.UlyssesParallelAttention(
+        sp_group,
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        get_forward_context()._sp_equal_pad_stack.append(True)
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    # Ring check ran: s_global = ulysses_world_size * local = 2 * 3.
+    assert ring_checks == [6]
+    assert observed == [([3, 3], 32), ([3, 3], 8), ([3, 3], 8)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_uaa_without_contract_keeps_dynamic_length_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No auto_pad boundary means shards may differ, so the gather must stay."""
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    observed = []
+    monkeypatch.setattr(
+        ulysses,
+        "_all_gather_int",
+        lambda *args, **kwargs: [3, 4],
+    )
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        observed.append(kwargs["seq_lens"])
+        return tensor, tensor.shape[2]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    strategy = ulysses.UlyssesParallelAttention(
+        FakeGroup(),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    assert observed == [[3, 4], [3, 4], [3, 4]]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_uaa_mixed_boundaries_keep_the_dynamic_length_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One manual boundary inside an auto_pad region voids the contract."""
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    gathered = []
+
+    def fake_gather(*args, **kwargs):
+        gathered.append(args)
+        return [3, 4]
+
+    monkeypatch.setattr(ulysses, "_all_gather_int", fake_gather)
+    monkeypatch.setattr(
+        ulysses,
+        "_ulysses_all_to_all_any_qkv",
+        lambda pg, tensor, **kwargs: (tensor, tensor.shape[2]),
+    )
+    strategy = ulysses.UlyssesParallelAttention(
+        FakeGroup(),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        ctx = get_forward_context()
+        ctx._sp_equal_pad_stack.extend([True, False])
+        assert not ctx.sp_rank_local_seq_lens_equal
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    assert len(gathered) == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_uaa_gqa_head_padding_preserves_the_query_to_kv_ratio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
