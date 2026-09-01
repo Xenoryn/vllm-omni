@@ -109,6 +109,85 @@ def test_uaa_rejects_head_counts_that_are_not_a_gqa_shape(
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    "q_heads, kv_heads, world_size, expected_warn",
+    [
+        # 28Q/7KV @ U=2 -> pad to 32Q, 32/28 = 1.14x, below threshold, no warn.
+        (28, 7, 2, False),
+        # 32Q/1KV @ U=8 -> pad KV to 8 -> pad Q to 256, 256/32 = 8x, warn.
+        (32, 1, 8, True),
+        # 16Q/2KV @ U=4 -> pad KV to 4 -> pad Q to 32, 32/16 = 2x, warn.
+        (16, 2, 4, True),
+    ],
+)
+def test_uaa_padding_ratio_warning_fires_when_blowup_is_large(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    q_heads: int,
+    kv_heads: int,
+    world_size: int,
+    expected_warn: bool,
+) -> None:
+    """advanced_uaa must warn once when GQA padding materially inflates Q heads.
+
+    MQA-style shapes at high ulysses_degree pad Q by U x, which grows attention
+    FLOPs and temporary VRAM by the same factor. We do not fall back (there is
+    no cheap alternative -- Ulysses needs KV divisible by U for the head-dim
+    split), but we surface a one-shot warning so the user can pick a
+    ulysses_degree that divides KV_heads if the overhead is unacceptable.
+    """
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    # Reset the warn-once dedup set so parametrized cases do not shadow each other.
+    ulysses._uaa_pad_ratio_warned.clear()
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = world_size
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        return tensor, tensor.shape[2]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    monkeypatch.setattr(ulysses, "_all_gather_int", lambda *a, **kw: [3] * world_size)
+    strategy = ulysses.UlyssesParallelAttention(
+        FakeGroup(),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    caplog.set_level("WARNING", logger="vllm_omni.diffusion.attention.parallel.ulysses")
+    with set_forward_context():
+        strategy.pre_attention(
+            torch.zeros(1, 3, q_heads, 4),
+            torch.zeros(1, 3, kv_heads, 4),
+            torch.zeros(1, 3, kv_heads, 4),
+            None,
+        )
+
+    warn_msgs = [r.message for r in caplog.records if "GQA padding inflates" in r.message]
+    if expected_warn:
+        assert len(warn_msgs) == 1, warn_msgs
+        # Second call with the same shape must not re-warn (warn-once dedup).
+        with set_forward_context():
+            strategy.pre_attention(
+                torch.zeros(1, 3, q_heads, 4),
+                torch.zeros(1, 3, kv_heads, 4),
+                torch.zeros(1, 3, kv_heads, 4),
+                None,
+            )
+        warn_msgs = [r.message for r in caplog.records if "GQA padding inflates" in r.message]
+        assert len(warn_msgs) == 1, "warn-once dedup should suppress the second call"
+    else:
+        assert warn_msgs == [], f"unexpected warning for {q_heads}Q/{kv_heads}KV @ U={world_size}: {warn_msgs}"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_uaa_joint_gqa_head_padding_preserves_the_query_to_kv_ratio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

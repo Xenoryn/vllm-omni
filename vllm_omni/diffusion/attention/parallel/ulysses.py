@@ -8,12 +8,62 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+logger = init_logger(__name__)
+
+# When advanced_uaa pads Q by the GQA ratio, MQA/very-uneven-GQA shapes can
+# inflate the query-head count substantially (worst case: MQA @ U=N pads Q from
+# H to N*H, an N x blow-up in Q attention work and temporary VRAM). Warn once
+# per (Q, KV, world_size) tuple when the ratio crosses this threshold so users
+# can pick a friendlier ulysses_degree if the overhead is unacceptable.
+_UAA_PAD_RATIO_WARN_THRESHOLD = 1.5
+_uaa_pad_ratio_warned: set[tuple[int, int, int, str]] = set()
+
+
+def _maybe_warn_uaa_pad_ratio(
+    query_head_cnt: int,
+    kv_head_cnt: int,
+    padded_query_head_cnt: int,
+    ulysses_world_size: int,
+    tensor_label: str,
+) -> None:
+    """Emit a one-shot warning when advanced_uaa padding materially inflates Q.
+
+    The padding itself is mandatory for correctness (Ulysses splits along the
+    head dim, so KV must be a multiple of ulysses_world_size and Q must stay a
+    multiple of KV to remain a valid GQA shape). There is no cheap fallback,
+    but the caller may want to know when the inflation is large enough to
+    justify picking a different ulysses_degree.
+    """
+    if query_head_cnt <= 0 or padded_query_head_cnt <= query_head_cnt:
+        return
+    ratio = padded_query_head_cnt / query_head_cnt
+    if ratio < _UAA_PAD_RATIO_WARN_THRESHOLD:
+        return
+    key = (query_head_cnt, kv_head_cnt, ulysses_world_size, tensor_label)
+    if key in _uaa_pad_ratio_warned:
+        return
+    _uaa_pad_ratio_warned.add(key)
+    logger.warning(
+        "Ulysses advanced_uaa GQA padding inflates %s heads %.2fx "
+        "(Q=%d, KV=%d, ulysses_degree=%d -> padded Q=%d). "
+        "Attention FLOPs and temporary VRAM for this tensor grow by the same "
+        "factor. If this is unacceptable, choose a ulysses_degree that divides "
+        "KV_heads (or the GCD of Q/KV) to reduce or eliminate padding.",
+        tensor_label,
+        ratio,
+        query_head_cnt,
+        kv_head_cnt,
+        ulysses_world_size,
+        padded_query_head_cnt,
+    )
 
 
 def _a2a_permute_enabled(enabled: bool, scatter_idx: int, gather_idx: int, world_size: int) -> bool:
@@ -275,6 +325,13 @@ class UlyssesParallelAttention:
                 padded_joint_kv_head_cnt = _ceil_div(joint_k_head_cnt, ulysses_world_size) * ulysses_world_size
                 gqa_ratio = joint_q_head_cnt // joint_k_head_cnt
                 padded_joint_q_head_cnt = padded_joint_kv_head_cnt * gqa_ratio
+                _maybe_warn_uaa_pad_ratio(
+                    joint_q_head_cnt,
+                    joint_k_head_cnt,
+                    padded_joint_q_head_cnt,
+                    ulysses_world_size,
+                    "joint_query",
+                )
 
                 joint_q_pad = padded_joint_q_head_cnt - joint_q_head_cnt
                 joint_kv_pad = padded_joint_kv_head_cnt - joint_k_head_cnt
@@ -367,6 +424,14 @@ class UlyssesParallelAttention:
             # the ratio survives the head-dim split (e.g. 28Q/7KV at SP2 becomes
             # 32/8, i.e. 16/4 per rank -- padding each independently would give
             # 14/4, which is not a valid GQA shape).
+            #
+            # Overhead: padded_Q = ceil(KV/U)*U * (Q/KV). This is exact for
+            # well-aligned shapes (0% overhead when U divides KV) but can be
+            # substantial for uneven GQA/MQA: 28Q/7KV @ U=2 pads to 32Q (+14%),
+            # 32Q/1KV @ U=8 pads to 256Q (8x). _maybe_warn_uaa_pad_ratio()
+            # surfaces a one-shot warning once the blow-up crosses
+            # _UAA_PAD_RATIO_WARN_THRESHOLD so callers can adjust
+            # ulysses_degree if the extra work / VRAM is unacceptable.
             query_head_cnt = int(query.shape[2])
             kv_head_cnt = int(key.shape[2])
             if key.shape[2] != value.shape[2] or query_head_cnt % kv_head_cnt != 0:
@@ -377,6 +442,13 @@ class UlyssesParallelAttention:
                 )
             padded_kv_head_cnt = _ceil_div(kv_head_cnt, ulysses_world_size) * ulysses_world_size
             padded_query_head_cnt = padded_kv_head_cnt * (query_head_cnt // kv_head_cnt)
+            _maybe_warn_uaa_pad_ratio(
+                query_head_cnt,
+                kv_head_cnt,
+                padded_query_head_cnt,
+                ulysses_world_size,
+                "query",
+            )
 
             query, orig_head_cnt = _ulysses_all_to_all_any_qkv(
                 self._ulysses_pg,
