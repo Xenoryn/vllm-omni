@@ -11,10 +11,10 @@ global sequence length alone.
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
-    BooguImageTransformer2DModel,
+from vllm_omni.diffusion.models.boogu_image.sp_layout import (
+    ShardLayout,
+    rank_concat_mask_or_none,
 )
-from vllm_omni.diffusion.models.boogu_image.sp_layout import ShardLayout
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -57,7 +57,7 @@ class TestRankConcatMask:
     """
 
     def test_mask_is_concatenation_of_per_rank_segments(self):
-        mask = BooguImageTransformer2DModel._rank_concat_mask_or_none(
+        mask = rank_concat_mask_or_none(
             [[2], [1]],
             capacity=3,
             like=torch.zeros(1, 1),
@@ -67,7 +67,7 @@ class TestRankConcatMask:
 
     def test_all_valid_mask_is_dropped(self):
         assert (
-            BooguImageTransformer2DModel._rank_concat_mask_or_none(
+            rank_concat_mask_or_none(
                 [[3], [3]],
                 capacity=3,
                 like=torch.zeros(1, 1),
@@ -76,7 +76,7 @@ class TestRankConcatMask:
         )
 
     def test_required_keeps_an_all_valid_mask(self):
-        mask = BooguImageTransformer2DModel._rank_concat_mask_or_none(
+        mask = rank_concat_mask_or_none(
             [[3], [3]],
             capacity=3,
             like=torch.zeros(1, 1),
@@ -123,7 +123,7 @@ class TestRankConcatEquivalence:
         layout = ShardLayout(original_seq_len=global_len, world_size=world_size, rank=0)
         per_rank = [layout.valid_lengths(sample_lengths, rank=r) for r in range(world_size)]
 
-        built = BooguImageTransformer2DModel._rank_concat_mask_or_none(
+        built = rank_concat_mask_or_none(
             per_rank,
             layout.local_seq_len,
             like=torch.zeros(1, 1),
