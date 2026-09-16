@@ -48,7 +48,12 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     fused_qk_norm_rope_min_tokens,
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
-from vllm_omni.diffusion.models.boogu_image.sp_layout import ShardLayout
+from vllm_omni.diffusion.models.boogu_image.sp_layout import (
+    RotaryEmbedding,
+    ShardLayout,
+    pack_local_rotary,
+    rank_concat_mask_or_none,
+)
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -56,10 +61,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# (cos, sin) — optionally (cos, sin, packed_table) where packed_table is the
-# fp32 [tokens, head_dim] = [cos(theta) | sin(theta)] layout the fused
-# qk-norm+RoPE op consumes; the eager path ignores the third element.
-RotaryEmbedding = tuple[torch.Tensor, ...]
 RotaryFrequencyTables = list[RotaryEmbedding]
 
 
@@ -1630,7 +1631,7 @@ class BooguImageTransformer2DModel(nn.Module):
             if sp_sharded:
                 # Ulysses will concatenate each rank's packed reference batch,
                 # so the mask must cover all ranks' segments.
-                ref_attention_mask = self._rank_concat_mask_or_none(
+                ref_attention_mask = rank_concat_mask_or_none(
                     [list(itertools.chain(*rank_lengths)) for rank_lengths in per_rank_ref_lengths],
                     max_ref_img_len,
                     like=batch_ref_img_mask,
@@ -1667,99 +1668,6 @@ class BooguImageTransformer2DModel(nn.Module):
             combined_img_hidden_states[i, sum(ref_img_len) : sum(ref_img_len) + img_len] = hidden_states[i, :img_len]
 
         return combined_img_hidden_states
-
-    @staticmethod
-    def _rank_concat_mask_or_none(
-        per_rank_lengths: list[list[int]],
-        capacity: int,
-        *,
-        like: torch.Tensor,
-        required: bool = False,
-    ) -> torch.Tensor | None:
-        """Mask over the rank-concatenated sequence Ulysses builds post all-to-all.
-
-        `per_rank_lengths[r][i]` is sample `i`'s valid length inside rank `r`'s
-        shard, and every shard has the same `capacity` (guaranteed by auto_pad),
-        so the global sequence is `world_size * capacity` long. Returns None for
-        an all-valid mask unless a padding contract requires one.
-        """
-        if not required and all(int(length) == capacity for lengths in per_rank_lengths for length in lengths):
-            return None
-
-        batch_size = len(per_rank_lengths[0])
-        mask = like.new_zeros(batch_size, len(per_rank_lengths) * capacity, dtype=torch.bool)
-        for rank, lengths in enumerate(per_rank_lengths):
-            base = rank * capacity
-            for i, length in enumerate(lengths):
-                mask[i, base : base + int(length)] = True
-        return mask
-
-    @staticmethod
-    def _pack_local_rotary(
-        context_rotary_emb: RotaryEmbedding,
-        ref_img_rotary_emb: RotaryEmbedding,
-        noise_rotary_emb: RotaryEmbedding,
-        encoder_seq_lengths: list[int],
-        ref_img_seq_lengths: list[list[int]],
-        img_seq_lengths: list[int],
-    ) -> tuple[RotaryEmbedding, RotaryEmbedding, list[int], list[int]]:
-        """Pack local RoPE as [context, references, noise].
-
-        Capacities stay equal across ranks; returned lengths exclude padding.
-        Rotary embeddings arrive as (cos, sin) pairs -- the same packing is
-        applied component-wise so both halves stay index-aligned.
-        """
-        context_cos, context_sin = context_rotary_emb
-        ref_cos, ref_sin = ref_img_rotary_emb
-        noise_cos, noise_sin = noise_rotary_emb
-
-        combined_img_seq_lengths = [
-            sum(ref_lengths) + img_length
-            for ref_lengths, img_length in zip(
-                ref_img_seq_lengths,
-                img_seq_lengths,
-            )
-        ]
-        seq_lengths = [
-            context_length + combined_length
-            for context_length, combined_length in zip(
-                encoder_seq_lengths,
-                combined_img_seq_lengths,
-            )
-        ]
-
-        def _pack_component(
-            context_t: torch.Tensor, ref_t: torch.Tensor, noise_t: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            batch_size = context_t.shape[0]
-            rotary_dim = context_t.shape[-1]
-            combined_img_capacity = ref_t.shape[1] + noise_t.shape[1]
-            combined_img = context_t.new_zeros(batch_size, combined_img_capacity, rotary_dim)
-            rotary = context_t.new_zeros(
-                batch_size,
-                context_t.shape[1] + combined_img_capacity,
-                rotary_dim,
-            )
-            for i, (context_length, ref_lengths, img_length) in enumerate(
-                zip(encoder_seq_lengths, ref_img_seq_lengths, img_seq_lengths)
-            ):
-                ref_length = sum(ref_lengths)
-                combined_length = ref_length + img_length
-                combined_img[i, :ref_length] = ref_t[i, :ref_length]
-                combined_img[i, ref_length:combined_length] = noise_t[i, :img_length]
-                rotary[i, :context_length] = context_t[i, :context_length]
-                rotary[i, context_length : context_length + combined_length] = combined_img[i, :combined_length]
-            return rotary, combined_img
-
-        rotary_cos, combined_img_cos = _pack_component(context_cos, ref_cos, noise_cos)
-        rotary_sin, combined_img_sin = _pack_component(context_sin, ref_sin, noise_sin)
-
-        return (
-            (rotary_cos, rotary_sin),
-            (combined_img_cos, combined_img_sin),
-            seq_lengths,
-            combined_img_seq_lengths,
-        )
 
     def forward(
         self,
@@ -1893,7 +1801,7 @@ class BooguImageTransformer2DModel(nn.Module):
             combined_img_rotary_emb,
             seq_lengths,
             combined_img_seq_lengths,
-        ) = self._pack_local_rotary(
+        ) = pack_local_rotary(
             context_rotary_emb,
             ref_img_rotary_emb,
             noise_rotary_emb,
@@ -1915,13 +1823,13 @@ class BooguImageTransformer2DModel(nn.Module):
             rotary_emb = _with_packed_rope_table(rotary_emb)
             combined_img_rotary_emb = _with_packed_rope_table(combined_img_rotary_emb)
 
-        context_attention_mask = self._rank_concat_mask_or_none(
+        context_attention_mask = rank_concat_mask_or_none(
             per_rank_encoder_lengths,
             context_layout.local_seq_len,
             like=instruction_attention_mask,
             required=context_mask_required,
         )
-        noise_attention_mask = self._rank_concat_mask_or_none(
+        noise_attention_mask = rank_concat_mask_or_none(
             per_rank_img_lengths,
             image_layout.local_seq_len,
             like=img_mask,
@@ -1962,7 +1870,7 @@ class BooguImageTransformer2DModel(nn.Module):
             [encoder_length + combined_length for encoder_length, combined_length in zip(enc_per_sample, comb)]
             for enc_per_sample, comb in zip(per_rank_encoder_lengths, per_rank_combined_img_lengths)
         ]
-        joint_attention_mask = self._rank_concat_mask_or_none(
+        joint_attention_mask = rank_concat_mask_or_none(
             per_rank_seq_lengths,
             rotary_emb[0].shape[1],
             like=hidden_states,
@@ -1971,7 +1879,7 @@ class BooguImageTransformer2DModel(nn.Module):
 
         # Dual-stream (double-stream) stage.
         if self.num_double_stream_layers > 0:
-            img_attention_mask = self._rank_concat_mask_or_none(
+            img_attention_mask = rank_concat_mask_or_none(
                 per_rank_combined_img_lengths,
                 combined_img_rotary_emb[0].shape[1],
                 like=hidden_states,
